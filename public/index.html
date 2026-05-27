@@ -527,6 +527,7 @@ input[type="file"] { display:none; }
 .model-pill .mp-dot.sonnet { background:#6b5b8a; }
 .model-pill .mp-dot.opus { background:var(--accent); }
 .model-pill .mp-dot.legacy { background:var(--error); }
+.model-pill .mp-dot.haiku { background:#5a8a6b; }
 .model-picker {
   display:none; position:absolute; top:100%; right:0; margin-top:6px; z-index:90;
   background:var(--bg-elevated); border:1px solid var(--border); border-radius:12px;
@@ -743,12 +744,13 @@ input[type="file"] { display:none; }
       <div class="settings-row">
         <label>Claude model</label>
         <select class="settings-select" id="sModel">
-          <option value="claude-sonnet-4-20250514">Sonnet 4 — $3/$15</option>
-          <option value="claude-sonnet-4-5-20250514">Sonnet 4.5 — $3/$15</option>
-          <option value="claude-opus-4-5-20250514">Opus 4.5 — $5/$25</option>
+          <option value="claude-sonnet-4-20250514">Sonnet 4 — $3/$15 (legacy)</option>
+          <option value="claude-sonnet-4-5-20250929">Sonnet 4.5 — $3/$15</option>
+          <option value="claude-sonnet-4-6">Sonnet 4.6 — $3/$15</option>
+          <option value="claude-opus-4-5-20251101">Opus 4.5 — $5/$25</option>
           <option value="claude-opus-4-6">Opus 4.6 — $5/$25</option>
           <option value="claude-opus-4-7">Opus 4.7 — $5/$25</option>
-          <option value="claude-3-opus-20240229">Opus 3 — $15/$75</option>
+          <option value="claude-haiku-4-5-20251001">Haiku 4.5 — $1/$5</option>
         </select>
       </div>
       <div style="font-size:.7rem;color:var(--text-3);margin-top:4px;font-style:italic">Prices per million tokens (input/output). Changes apply immediately.</div>
@@ -774,17 +776,19 @@ let lincolnStatus = 'present'; // Lincoln's self-set status text
 let currentMood=null, seenObserver=null;
 let activeModel = 'claude-sonnet-4-20250514';
 const MODEL_META = {
-  'claude-sonnet-4-20250514': { label:'Sonnet 4', tier:'sonnet' },
-  'claude-sonnet-4-5-20250514': { label:'Sonnet 4.5', tier:'sonnet' },
-  'claude-opus-4-5-20250514': { label:'Opus 4.5', tier:'opus' },
+  'claude-sonnet-4-20250514': { label:'Sonnet 4', tier:'legacy' },
+  'claude-sonnet-4-5-20250929': { label:'Sonnet 4.5', tier:'sonnet' },
+  'claude-sonnet-4-6': { label:'Sonnet 4.6', tier:'sonnet' },
+  'claude-opus-4-5-20251101': { label:'Opus 4.5', tier:'opus' },
   'claude-opus-4-6': { label:'Opus 4.6', tier:'opus' },
   'claude-opus-4-7': { label:'Opus 4.7', tier:'opus' },
-  'claude-3-opus-20240229': { label:'Opus 3', tier:'legacy' }
+  'claude-haiku-4-5-20251001': { label:'Haiku 4.5', tier:'haiku' }
 };
 const MODEL_COSTS = {
-  'claude-sonnet-4-20250514':'$3/$15','claude-sonnet-4-5-20250514':'$3/$15',
-  'claude-opus-4-5-20250514':'$5/$25','claude-opus-4-6':'$5/$25','claude-opus-4-7':'$5/$25',
-  'claude-3-opus-20240229':'$15/$75'
+  'claude-sonnet-4-20250514':'$3/$15','claude-sonnet-4-5-20250929':'$3/$15',
+  'claude-sonnet-4-6':'$3/$15','claude-opus-4-5-20251101':'$5/$25',
+  'claude-opus-4-6':'$5/$25','claude-opus-4-7':'$5/$25',
+  'claude-haiku-4-5-20251001':'$1/$5'
 };
 
 // Authenticated fetch wrapper

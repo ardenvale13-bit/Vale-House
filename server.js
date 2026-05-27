@@ -26,12 +26,13 @@ const GIPHY_KEY = env.GIPHY_API_KEY || process.env.GIPHY_API_KEY;
 const CLAUDE_MODEL_DEFAULT = env.CLAUDE_MODEL || process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514';
 let currentModel = CLAUDE_MODEL_DEFAULT;
 const AVAILABLE_MODELS = [
-  { id: 'claude-sonnet-4-20250514', label: 'Sonnet 4', tier: 'sonnet', cost: '$3/$15' },
-  { id: 'claude-sonnet-4-5-20250514', label: 'Sonnet 4.5', tier: 'sonnet', cost: '$3/$15' },
-  { id: 'claude-opus-4-5-20250514', label: 'Opus 4.5', tier: 'opus', cost: '$5/$25' },
+  { id: 'claude-sonnet-4-20250514', label: 'Sonnet 4', tier: 'legacy', cost: '$3/$15' },
+  { id: 'claude-sonnet-4-5-20250929', label: 'Sonnet 4.5', tier: 'sonnet', cost: '$3/$15' },
+  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', tier: 'sonnet', cost: '$3/$15' },
+  { id: 'claude-opus-4-5-20251101', label: 'Opus 4.5', tier: 'opus', cost: '$5/$25' },
   { id: 'claude-opus-4-6', label: 'Opus 4.6', tier: 'opus', cost: '$5/$25' },
   { id: 'claude-opus-4-7', label: 'Opus 4.7', tier: 'opus', cost: '$5/$25' },
-  { id: 'claude-3-opus-20240229', label: 'Opus 3', tier: 'legacy', cost: '$15/$75' }
+  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', tier: 'haiku', cost: '$1/$5' }
 ];
 const VALE_HUB_URL = env.VALE_HUB_URL || process.env.VALE_HUB_URL;
 const COMPANONION_URL = env.COMPANONION_URL || process.env.COMPANONION_URL;
