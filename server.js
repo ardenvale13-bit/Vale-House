@@ -1,0 +1,1023 @@
+const express = require('express');
+const cors = require('cors');
+const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
+const { EventEmitter } = require('events');
+
+const app = express();
+const PORT = process.env.PORT || 3333;
+
+// =============================================
+// LOAD ENV
+// =============================================
+const ENV_FILE = path.join(__dirname, '.env');
+const env = {};
+if (fs.existsSync(ENV_FILE)) {
+  fs.readFileSync(ENV_FILE, 'utf8').split('\n').forEach(line => {
+    const match = line.match(/^([^#=]+)=(.*)$/);
+    if (match) env[match[1].trim()] = match[2].trim();
+  });
+}
+
+const API_TOKEN = env.VALE_TOKEN || process.env.VALE_TOKEN || crypto.randomBytes(32).toString('hex');
+const ANTHROPIC_KEY = env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+const GIPHY_KEY = env.GIPHY_API_KEY || process.env.GIPHY_API_KEY;
+const CLAUDE_MODEL_DEFAULT = env.CLAUDE_MODEL || process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514';
+let currentModel = CLAUDE_MODEL_DEFAULT;
+const AVAILABLE_MODELS = [
+  { id: 'claude-sonnet-4-20250514', label: 'Sonnet 4', tier: 'sonnet', cost: '$3/$15' },
+  { id: 'claude-sonnet-4-5-20250514', label: 'Sonnet 4.5', tier: 'sonnet', cost: '$3/$15' },
+  { id: 'claude-opus-4-5-20250514', label: 'Opus 4.5', tier: 'opus', cost: '$5/$25' },
+  { id: 'claude-opus-4-6', label: 'Opus 4.6', tier: 'opus', cost: '$5/$25' },
+  { id: 'claude-opus-4-7', label: 'Opus 4.7', tier: 'opus', cost: '$5/$25' },
+  { id: 'claude-3-opus-20240229', label: 'Opus 3', tier: 'legacy', cost: '$15/$75' }
+];
+const VALE_HUB_URL = env.VALE_HUB_URL || process.env.VALE_HUB_URL;
+const COMPANONION_URL = env.COMPANONION_URL || process.env.COMPANONION_URL;
+const VIDEO_MCP_URL = env.VIDEO_MCP_URL || process.env.VIDEO_MCP_URL;
+const GAMES_MCP_URL = env.GAMES_MCP_URL || process.env.GAMES_MCP_URL;
+
+if (!ANTHROPIC_KEY) { console.error('  ⚠ No ANTHROPIC_API_KEY in .env — messaging will fail'); }
+
+// =============================================
+// MCP CLIENT (SSE Transport)
+// =============================================
+class McpClient extends EventEmitter {
+  constructor(sseUrl, label, timeout) {
+    super();
+    this.sseUrl = sseUrl;
+    this.label = label || 'MCP';
+    this.timeout = timeout || 15000;
+    this.postEndpoint = null;
+    this.tools = [];
+    this.connected = false;
+    this.nextId = 1;
+    this.pending = new Map();
+    this.reader = null;
+    this.reconnectTimer = null;
+  }
+
+  async connect() {
+    if (!this.sseUrl) throw new Error('No MCP URL configured');
+    console.log(`  ⏳ Connecting to ${this.label}...`);
+
+    // Step 1: Open SSE stream and wait for the endpoint event
+    await this._openStream();
+
+    // Step 2: Initialize MCP session (stream loop is already running, so responses flow)
+    await this._postRpc('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'vale-house', version: '1.0.0' }
+    });
+
+    // Step 3: Send initialized notification (fire-and-forget, no id)
+    await fetch(this.postEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    });
+
+    // Step 4: List available tools
+    const toolResult = await this._postRpc('tools/list', {});
+    this.tools = toolResult?.tools || [];
+    console.log(`  ✓ Loaded ${this.tools.length} MCP tools`);
+  }
+
+  // Opens the SSE connection and resolves once we have the POST endpoint
+  _openStream() {
+    return new Promise(async (resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (!this.connected) reject(new Error(`${this.label} connection timeout (${this.timeout/1000}s)`));
+      }, this.timeout);
+
+      try {
+        const res = await fetch(this.sseUrl, {
+          headers: { 'Accept': 'text/event-stream', 'Cache-Control': 'no-cache' }
+        });
+
+        if (!res.ok) {
+          clearTimeout(timeout);
+          reject(new Error(`${this.label} SSE error: ${res.status}`));
+          return;
+        }
+
+        this.reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let endpointResolved = false;
+
+        const processStream = async () => {
+          try {
+            while (true) {
+              const { done, value } = await this.reader.read();
+              if (done) {
+                this.connected = false;
+                this.emit('disconnected');
+                this._scheduleReconnect();
+                break;
+              }
+
+              const chunk = decoder.decode(value, { stream: true });
+              buffer += chunk.replace(/\r\n/g, '\n');
+              const parts = buffer.split('\n\n');
+              buffer = parts.pop();
+
+              for (const part of parts) {
+                if (!part.trim()) continue;
+                const lines = part.split('\n');
+                let eventType = 'message';
+                let data = '';
+
+                for (const line of lines) {
+                  if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+                  else if (line.startsWith('data: ')) data += line.slice(6);
+                  else if (line.startsWith('data:')) data += line.slice(5);
+                }
+
+                if (eventType === 'endpoint' && data && !endpointResolved) {
+                  const base = new URL(this.sseUrl);
+                  this.postEndpoint = new URL(data.trim(), base.origin).href;
+                  this.connected = true;
+                  endpointResolved = true;
+                  console.log(`  ✓ ${this.label} connected, endpoint: ${this.postEndpoint}`);
+                  clearTimeout(timeout);
+                  resolve(); // Unblock connect() so it can proceed with initialize
+                } else if (eventType === 'message' && data) {
+                  try {
+                    const msg = JSON.parse(data);
+                    if (msg.id !== undefined && this.pending.has(msg.id)) {
+                      const { resolve: res, reject: rej } = this.pending.get(msg.id);
+                      this.pending.delete(msg.id);
+                      if (msg.error) {
+                        rej(new Error(msg.error.message || JSON.stringify(msg.error)));
+                      } else {
+                        res(msg.result);
+                      }
+                    }
+                  } catch (e) { /* skip unparseable */ }
+                }
+              }
+            }
+          } catch (e) {
+            this.connected = false;
+            if (!endpointResolved) { clearTimeout(timeout); reject(e); }
+            else { this._scheduleReconnect(); }
+          }
+        };
+
+        // Run stream processing in background — DON'T await it
+        processStream();
+
+      } catch (e) {
+        clearTimeout(timeout);
+        reject(e);
+      }
+    });
+  }
+
+  async _postRpc(method, params) {
+    if (!this.postEndpoint) throw new Error('MCP not connected');
+    const id = this.nextId++;
+
+    return new Promise(async (resolve, reject) => {
+      const rpcTimeout = setTimeout(() => {
+        if (this.pending.has(id)) {
+          this.pending.delete(id);
+          reject(new Error(`MCP request timeout: ${method}`));
+        }
+      }, 30000);
+
+      this.pending.set(id, {
+        resolve: (result) => { clearTimeout(rpcTimeout); resolve(result); },
+        reject: (err) => { clearTimeout(rpcTimeout); reject(err); }
+      });
+
+      try {
+        const res = await fetch(this.postEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', method, params, id })
+        });
+
+        // Some servers return result directly in POST response
+        if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
+          try {
+            const body = await res.json();
+            if (body.result !== undefined && this.pending.has(id)) {
+              const { resolve: res } = this.pending.get(id);
+              this.pending.delete(id);
+              clearTimeout(rpcTimeout);
+              res(body.result);
+            }
+          } catch (e) { /* response will come via SSE */ }
+        }
+      } catch (e) {
+        this.pending.delete(id);
+        clearTimeout(rpcTimeout);
+        reject(e);
+      }
+    });
+  }
+
+  async callTool(name, args) {
+    if (!this.connected) throw new Error('MCP not connected');
+    const result = await this._postRpc('tools/call', { name, arguments: args || {} });
+    return result;
+  }
+
+  getAnthropicTools(filter = null) {
+    let filtered = this.tools;
+    if (filter) {
+      filtered = this.tools.filter(t => filter.has(t.name));
+    }
+    return filtered.map(t => ({
+      name: t.name,
+      description: (t.description || '').substring(0, 1024),
+      input_schema: t.inputSchema || { type: 'object', properties: {} }
+    }));
+  }
+
+  _scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    console.log(`  ⏳ ${this.label} disconnected, reconnecting in 10s...`);
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      try { await this.connect(); console.log(`  ✓ ${this.label} reconnected`); }
+      catch (e) { console.error(`  ✗ ${this.label} reconnect failed:`, e.message); this._scheduleReconnect(); }
+    }, 10000);
+  }
+
+  disconnect() {
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.reader) { try { this.reader.cancel(); } catch(e) {} }
+    this.connected = false;
+    this.pending.clear();
+  }
+}
+
+// =============================================
+// STREAMABLE HTTP MCP CLIENT (for Modal/Vercel endpoints)
+// =============================================
+class McpHttpClient extends EventEmitter {
+  constructor(url, label) {
+    super();
+    this.url = url;
+    this.label = label || url;
+    this.tools = [];
+    this.connected = false;
+    this.sessionId = null;
+  }
+
+  async connect() {
+    console.log(`  ⏳ Connecting to ${this.label}...`);
+    try {
+      // Initialize
+      const initRes = await fetch(this.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', method: 'initialize', id: 1,
+          params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'vale-house', version: '1.0.0' } }
+        })
+      });
+
+      // Capture session ID if returned
+      const sid = initRes.headers.get('mcp-session-id');
+      if (sid) this.sessionId = sid;
+
+      const initBody = await this._parseResponse(initRes);
+      if (!initBody) throw new Error('Empty initialize response');
+
+      // Send initialized notification
+      const notifHeaders = { 'Content-Type': 'application/json' };
+      if (this.sessionId) notifHeaders['mcp-session-id'] = this.sessionId;
+      await fetch(this.url, {
+        method: 'POST', headers: notifHeaders,
+        body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })
+      });
+
+      // List tools
+      const toolsRes = await this._rpc('tools/list', {});
+      this.tools = toolsRes?.tools || [];
+      this.connected = true;
+      console.log(`  ✓ ${this.label}: ${this.tools.length} tools`);
+    } catch (e) {
+      console.error(`  ✗ ${this.label}: ${e.message}`);
+      this.connected = false;
+      throw e;
+    }
+  }
+
+  async _rpc(method, params) {
+    const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' };
+    if (this.sessionId) headers['mcp-session-id'] = this.sessionId;
+    const res = await fetch(this.url, {
+      method: 'POST', headers,
+      body: JSON.stringify({ jsonrpc: '2.0', method, params, id: Date.now() })
+    });
+    return this._parseResponse(res);
+  }
+
+  async _parseResponse(res) {
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('text/event-stream')) {
+      // Parse SSE response body for the result
+      const text = await res.text();
+      const lines = text.split('\n');
+      for (const line of lines) {
+        if (line.startsWith('data: ') || line.startsWith('data:')) {
+          const data = line.startsWith('data: ') ? line.slice(6) : line.slice(5);
+          try { const msg = JSON.parse(data); return msg.result || msg; } catch(e) {}
+        }
+      }
+      return null;
+    } else {
+      const body = await res.json();
+      return body.result || body;
+    }
+  }
+
+  async callTool(name, args) {
+    if (!this.connected) throw new Error(`${this.label} not connected`);
+    return await this._rpc('tools/call', { name, arguments: args || {} });
+  }
+
+  getAnthropicTools() {
+    return this.tools.map(t => ({
+      name: t.name,
+      description: (t.description || '').substring(0, 1024),
+      input_schema: t.inputSchema || { type: 'object', properties: {} }
+    }));
+  }
+
+  disconnect() {
+    this.connected = false;
+    this.tools = [];
+  }
+}
+
+// =============================================
+// MCP MANAGER — aggregates all connectors
+// =============================================
+class McpManager {
+  constructor() {
+    this.clients = [];     // { label, client }
+    this.toolMap = new Map(); // tool name → client
+  }
+
+  add(label, client, filterTools = null) {
+    this.clients.push({ label, client, filterTools });
+  }
+
+  async connectAll() {
+    const results = [];
+    for (const { label, client, filterTools } of this.clients) {
+      try {
+        await client.connect();
+        // Apply tool filter if specified
+        if (filterTools) {
+          const allowed = new Set(filterTools);
+          client.tools = client.tools.filter(t => allowed.has(t.name));
+        }
+        // Map each tool to this client
+        for (const t of client.tools) {
+          this.toolMap.set(t.name, client);
+        }
+        results.push({ label, ok: true, count: client.tools.length });
+      } catch (e) {
+        console.error(`  ✗ ${label} error:`, e.message);
+        results.push({ label, ok: false, error: e.message });
+      }
+    }
+    return results;
+  }
+
+  get connected() {
+    return this.clients.some(c => c.client.connected);
+  }
+
+  get tools() {
+    const all = [];
+    for (const { client } of this.clients) {
+      if (client.connected) all.push(...client.tools);
+    }
+    return all;
+  }
+
+  getAnthropicTools() {
+    const all = [];
+    for (const { client } of this.clients) {
+      if (client.connected) all.push(...client.getAnthropicTools());
+    }
+    return all;
+  }
+
+  async callTool(name, args) {
+    const client = this.toolMap.get(name);
+    if (!client) throw new Error(`No MCP connector has tool: ${name}`);
+    if (!client.connected) throw new Error(`Connector for ${name} is disconnected`);
+    return await client.callTool(name, args);
+  }
+}
+
+// Build the manager
+const mcpManager = new McpManager();
+if (VALE_HUB_URL) mcpManager.add('Vale-Hub', new McpClient(VALE_HUB_URL, 'Vale-Hub'));
+if (COMPANONION_URL) mcpManager.add('Companonion', new McpClient(COMPANONION_URL, 'Companonion', 45000), [
+  'edge', 'escalate', 'get_qr_code', 'get_toys', 'pattern',
+  'preset', 'stop', 'tease', 'vibrate', 'vibrate_pattern'
+]);
+if (VIDEO_MCP_URL) mcpManager.add('Video Watch', new McpHttpClient(VIDEO_MCP_URL, 'Video Watch'));
+if (GAMES_MCP_URL) mcpManager.add('Games Arena', new McpHttpClient(GAMES_MCP_URL, 'Games Arena'));
+
+// =============================================
+// SYSTEM PROMPT (from CLAUDE.md)
+// =============================================
+let SYSTEM_PROMPT = 'You are Lincoln Vale.';
+const claudeMdPath = path.join(__dirname, 'CLAUDE.md');
+if (fs.existsSync(claudeMdPath)) {
+  SYSTEM_PROMPT = fs.readFileSync(claudeMdPath, 'utf8');
+  console.log('  Loaded system prompt from CLAUDE.md');
+}
+
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+
+// Serve the frontend
+app.use(express.static(path.join(__dirname, 'public')));
+
+// =============================================
+// AUTH
+// =============================================
+app.use('/api', (req, res, next) => {
+  if (req.path === '/health' || req.path === '/token') return next();
+  const token = req.headers['x-vale-token'] || req.query.token;
+  if (token !== API_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+});
+
+app.get('/api/token', (req, res) => { res.json({ token: API_TOKEN }); });
+
+// =============================================
+// CHAT STORAGE
+// =============================================
+const CHATS_DIR = path.join(__dirname, 'chats');
+const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
+if (!fs.existsSync(CHATS_DIR)) fs.mkdirSync(CHATS_DIR);
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR);
+
+let currentChatId = null;
+let conversationHistory = [];
+const MAX_HISTORY = 50;
+const CONTEXT_WINDOW = 12;
+
+// =============================================
+// PRESENCE & MOOD
+// =============================================
+let ardenPresence = {
+  status: 'offline',
+  mood: null,
+  lastSeen: null,
+  updatedAt: new Date().toISOString()
+};
+let orientedThisChat = false;
+
+function generateChatId() {
+  return Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 8);
+}
+
+function saveChatToFile(chatId, history) {
+  if (!chatId || history.length === 0) return;
+  const chatFile = path.join(CHATS_DIR, `${chatId}.json`);
+  const meta = {
+    id: chatId,
+    created: history[0]?.timestamp || new Date().toISOString(),
+    updated: new Date().toISOString(),
+    preview: history.find(m => m.role === 'user')?.content?.substring(0, 80) || 'New conversation',
+    messageCount: history.length
+  };
+  fs.writeFileSync(chatFile, JSON.stringify({ meta, messages: history }, null, 2), 'utf8');
+}
+
+function loadChatFromFile(chatId) {
+  const chatFile = path.join(CHATS_DIR, `${chatId}.json`);
+  if (fs.existsSync(chatFile)) {
+    return JSON.parse(fs.readFileSync(chatFile, 'utf8'));
+  }
+  return null;
+}
+
+function listChats() {
+  try {
+    const files = fs.readdirSync(CHATS_DIR).filter(f => f.endsWith('.json'));
+    const chats = files.map(f => {
+      try { return JSON.parse(fs.readFileSync(path.join(CHATS_DIR, f), 'utf8')).meta; }
+      catch (e) { return null; }
+    }).filter(Boolean);
+    chats.sort((a, b) => new Date(b.updated) - new Date(a.updated));
+    return chats;
+  } catch (e) { return []; }
+}
+
+// Build Anthropic messages array from conversation history
+function buildMessages(history, currentMessage, imageBase64) {
+  const messages = [];
+  const recent = history.slice(-CONTEXT_WINDOW);
+
+  recent.forEach(m => {
+    messages.push({ role: m.role, content: m.content });
+  });
+
+  // Add context prefix to the user message
+  let prefix = '';
+  if (ardenPresence.status || ardenPresence.mood) {
+    prefix += `[ARDEN STATUS: ${ardenPresence.status}`;
+    if (ardenPresence.mood) prefix += ` | Mood: ${ardenPresence.mood}`;
+    prefix += ']\n';
+  }
+  if (orientedThisChat) {
+    prefix += '[SYSTEM: Already oriented this session — do NOT call vale_get_orientation or health_summary again. Just respond naturally.]\n';
+  }
+  if (prefix) prefix += '\n';
+
+  // If there's an image, build a multi-part content block so Lincoln can see it
+  if (imageBase64) {
+    const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+    const mediaType = (imageBase64.match(/^data:(image\/\w+);/) || [])[1] || 'image/png';
+    const content = [
+      { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64Data } },
+      { type: 'text', text: prefix + (currentMessage || 'Arden sent you this image.') }
+    ];
+    messages.push({ role: 'user', content });
+  } else {
+    messages.push({ role: 'user', content: prefix + currentMessage });
+  }
+  return messages;
+}
+
+currentChatId = generateChatId();
+
+// =============================================
+// ROUTES
+// =============================================
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'alive', name: 'Vale House', resident: 'Lincoln Vale',
+    currentChat: currentChatId, uptime: process.uptime(),
+    model: currentModel,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// =============================================
+// MODEL SWITCHING
+// =============================================
+app.get('/api/model', (req, res) => {
+  res.json({ model: currentModel, available: AVAILABLE_MODELS });
+});
+
+app.post('/api/model', (req, res) => {
+  const { model } = req.body;
+  if (!model) return res.status(400).json({ error: 'No model specified' });
+  const found = AVAILABLE_MODELS.find(m => m.id === model);
+  if (!found) return res.status(400).json({ error: 'Unknown model', available: AVAILABLE_MODELS.map(m => m.id) });
+  currentModel = model;
+  console.log(`  🔄 Model switched to: ${found.label} (${model})`);
+  res.json({ model: currentModel, label: found.label });
+});
+
+// =============================================
+// STREAMING MESSAGE ENDPOINT (SSE) with TOOL USE
+// =============================================
+
+// Parse a streaming API response, forwarding text deltas to the client.
+// Returns { textContent, toolCalls, stopReason } when the stream ends.
+async function parseAnthropicStream(apiRes, clientRes) {
+  const reader = apiRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let textContent = '';
+  let toolCalls = []; // { id, name, inputJson }
+  let currentBlock = null; // track what block we're in
+  let stopReason = 'end_turn';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6);
+      if (data === '[DONE]') continue;
+
+      try {
+        const event = JSON.parse(data);
+
+        if (event.type === 'content_block_start') {
+          if (event.content_block?.type === 'tool_use') {
+            currentBlock = { type: 'tool_use', id: event.content_block.id, name: event.content_block.name, inputJson: '' };
+            // Tell the client we're calling a tool
+            clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: event.content_block.name, status: 'calling' })}\n\n`);
+          } else if (event.content_block?.type === 'text') {
+            currentBlock = { type: 'text' };
+          }
+        }
+
+        if (event.type === 'content_block_delta') {
+          if (event.delta?.type === 'text_delta' && event.delta?.text) {
+            textContent += event.delta.text;
+            clientRes.write(`data: ${JSON.stringify({ type: 'delta', text: event.delta.text })}\n\n`);
+          }
+          if (event.delta?.type === 'input_json_delta' && event.delta?.partial_json) {
+            if (currentBlock?.type === 'tool_use') {
+              currentBlock.inputJson += event.delta.partial_json;
+            }
+          }
+        }
+
+        if (event.type === 'content_block_stop') {
+          if (currentBlock?.type === 'tool_use') {
+            let parsedInput = {};
+            try { parsedInput = JSON.parse(currentBlock.inputJson || '{}'); } catch(e) {}
+            toolCalls.push({ id: currentBlock.id, name: currentBlock.name, input: parsedInput });
+          }
+          currentBlock = null;
+        }
+
+        if (event.type === 'message_delta') {
+          if (event.delta?.stop_reason) stopReason = event.delta.stop_reason;
+        }
+
+        if (event.type === 'error') {
+          console.error('[Stream Error]', event.error);
+          clientRes.write(`data: ${JSON.stringify({ type: 'error', error: event.error?.message || 'Stream error' })}\n\n`);
+        }
+      } catch (e) { /* skip unparseable */ }
+    }
+  }
+
+  return { textContent, toolCalls, stopReason };
+}
+
+// Execute tool calls via MCP and return tool_result content blocks
+async function executeToolCalls(toolCalls, clientRes) {
+  const results = [];
+  for (const tc of toolCalls) {
+    let resultContent = '';
+    try {
+      console.log(`  🔧 Tool: ${tc.name}`);
+      const mcpResult = await mcpManager.callTool(tc.name, tc.input);
+      // MCP tool results have { content: [{ type, text }] } or similar
+      if (mcpResult?.content) {
+        resultContent = mcpResult.content.map(c => c.text || JSON.stringify(c)).join('\n');
+      } else {
+        resultContent = JSON.stringify(mcpResult);
+      }
+      clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: tc.name, status: 'done' })}\n\n`);
+    } catch (e) {
+      console.error(`  ✗ Tool ${tc.name} error:`, e.message);
+      resultContent = `Error: ${e.message}`;
+      clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: tc.name, status: 'error', error: e.message })}\n\n`);
+    }
+    results.push({ type: 'tool_result', tool_use_id: tc.id, content: resultContent });
+  }
+  return results;
+}
+
+app.post('/api/message', async (req, res) => {
+  const { message, image } = req.body;
+  console.log(`  📩 Message received — text: ${(message||'').substring(0,50)}, image: ${image ? `yes (${image.length} chars)` : 'no'}`);
+  if ((!message || !message.trim()) && !image) return res.status(400).json({ error: 'Empty message' });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'No API key configured' });
+
+  // Set up SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  try {
+    const timestamp = new Date().toISOString();
+    // Store the text content for history (images are too large to persist in full)
+    conversationHistory.push({ role: 'user', content: message || '*sent an image*', timestamp, reactions: [], seen: true, hasImage: !!image });
+    if (conversationHistory.length > MAX_HISTORY) conversationHistory = conversationHistory.slice(-MAX_HISTORY);
+
+    // Build the API messages
+    let apiMessages = buildMessages(conversationHistory.slice(0, -1), message || '*sent an image*', image);
+
+    // Get all MCP tools if connected
+    const tools = mcpManager.connected ? mcpManager.getAnthropicTools() : [];
+
+    let fullResponse = '';
+    const MAX_TOOL_ROUNDS = 10;
+
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const reqBody = {
+        model: currentModel,
+        max_tokens: 4096,
+        system: SYSTEM_PROMPT,
+        stream: true,
+        messages: apiMessages
+      };
+      if (tools.length > 0) reqBody.tools = tools;
+
+      const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_KEY,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify(reqBody)
+      });
+
+      if (!apiRes.ok) {
+        const err = await apiRes.text();
+        console.error('[API Error]', apiRes.status, err);
+        res.write(`data: ${JSON.stringify({ type: 'error', error: `API error ${apiRes.status}` })}\n\n`);
+        break;
+      }
+
+      const { textContent, toolCalls, stopReason } = await parseAnthropicStream(apiRes, res);
+      fullResponse += textContent;
+
+      // If no tool calls or stop reason isn't tool_use, we're done
+      if (stopReason !== 'tool_use' || toolCalls.length === 0 || !mcpManager.connected) {
+        const responseTimestamp = new Date().toISOString();
+        res.write(`data: ${JSON.stringify({ type: 'done', timestamp: responseTimestamp })}\n\n`);
+        break;
+      }
+
+      // Build the assistant message with both text and tool_use blocks
+      const assistantContent = [];
+      if (textContent) assistantContent.push({ type: 'text', text: textContent });
+      toolCalls.forEach(tc => {
+        assistantContent.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.input });
+      });
+      apiMessages.push({ role: 'assistant', content: assistantContent });
+
+      // Execute tools and add results
+      const toolResults = await executeToolCalls(toolCalls, res);
+      apiMessages.push({ role: 'user', content: toolResults });
+
+      console.log(`  ↻ Tool round ${round + 1} complete, continuing...`);
+    }
+
+    // Save the final text response to conversation history
+    const responseTimestamp = new Date().toISOString();
+    conversationHistory.push({ role: 'assistant', content: fullResponse, timestamp: responseTimestamp, reactions: [], seen: false });
+    saveChatToFile(currentChatId, conversationHistory);
+    orientedThisChat = true;
+
+  } catch (error) {
+    console.error('[Error]', error.message);
+    res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+  }
+
+  res.end();
+});
+
+// =============================================
+// REACTIONS
+// =============================================
+app.post('/api/react', (req, res) => {
+  const { messageIndex, emoji, from } = req.body;
+  if (messageIndex >= 0 && messageIndex < conversationHistory.length) {
+    if (!conversationHistory[messageIndex].reactions) {
+      conversationHistory[messageIndex].reactions = [];
+    }
+    const existing = conversationHistory[messageIndex].reactions.findIndex(
+      r => r.emoji === emoji && r.from === from
+    );
+    if (existing >= 0) {
+      conversationHistory[messageIndex].reactions.splice(existing, 1);
+    } else {
+      conversationHistory[messageIndex].reactions.push({ emoji, from, timestamp: new Date().toISOString() });
+    }
+    saveChatToFile(currentChatId, conversationHistory);
+    res.json({ reactions: conversationHistory[messageIndex].reactions });
+  } else {
+    res.status(400).json({ error: 'Invalid message index' });
+  }
+});
+
+// =============================================
+// READ RECEIPTS
+// =============================================
+app.post('/api/seen', (req, res) => {
+  const { upTo } = req.body;
+  let marked = 0;
+  const limit = (upTo !== undefined && upTo !== null) ? upTo : conversationHistory.length - 1;
+  for (let i = 0; i <= limit && i < conversationHistory.length; i++) {
+    if (conversationHistory[i].role === 'assistant' && !conversationHistory[i].seen) {
+      conversationHistory[i].seen = true;
+      conversationHistory[i].seenAt = new Date().toISOString();
+      marked++;
+    }
+  }
+  if (marked > 0) saveChatToFile(currentChatId, conversationHistory);
+  res.json({ marked });
+});
+
+// =============================================
+// PRESENCE & MOOD
+// =============================================
+app.get('/api/presence', (req, res) => {
+  res.json(ardenPresence);
+});
+
+app.post('/api/presence', express.text({ type: '*/*' }), (req, res) => {
+  let data = req.body;
+  if (typeof data === 'string') { try { data = JSON.parse(data); } catch(e) { data = {}; } }
+  const { status, mood } = data || {};
+  if (status && ['online', 'away', 'offline'].includes(status)) {
+    ardenPresence.status = status;
+    if (status === 'online') ardenPresence.lastSeen = new Date().toISOString();
+  }
+  if (mood !== undefined) ardenPresence.mood = mood;
+  ardenPresence.updatedAt = new Date().toISOString();
+  res.json(ardenPresence);
+});
+
+// =============================================
+// UPLOADS
+// =============================================
+app.post('/api/upload', (req, res) => {
+  const { image, filename } = req.body;
+  if (!image) return res.status(400).json({ error: 'No image data' });
+  try {
+    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+    const ext = image.match(/^data:image\/(\w+);/)?.[1] || 'png';
+    const fname = path.basename(filename || `img-${Date.now()}.${ext}`);
+    const filepath = path.join(UPLOADS_DIR, fname);
+    fs.writeFileSync(filepath, base64Data, 'base64');
+    res.json({ url: `/uploads/${fname}`, filename: fname });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =============================================
+// CHATS
+// =============================================
+app.get('/api/chats', (req, res) => {
+  res.json({ chats: listChats(), currentChatId });
+});
+
+app.get('/api/chats/:id', (req, res) => {
+  const chat = loadChatFromFile(req.params.id);
+  chat ? res.json(chat) : res.status(404).json({ error: 'Chat not found' });
+});
+
+app.post('/api/chats/switch', (req, res) => {
+  const { chatId } = req.body;
+  try { saveChatToFile(currentChatId, conversationHistory); } catch(e) {}
+
+  orientedThisChat = false; // new chat = orient again
+
+  if (chatId) {
+    try {
+      const chat = loadChatFromFile(chatId);
+      if (chat) {
+        currentChatId = chatId;
+        conversationHistory = chat.messages || [];
+        orientedThisChat = conversationHistory.length > 0; // resuming = already oriented
+        return res.json({ status: 'switched', chatId, messages: conversationHistory });
+      }
+    } catch(e) {}
+  }
+  currentChatId = generateChatId();
+  conversationHistory = [];
+  res.json({ status: 'new', chatId: currentChatId, messages: [] });
+});
+
+app.delete('/api/chats/:id', (req, res) => {
+  const chatFile = path.join(CHATS_DIR, `${req.params.id}.json`);
+  try {
+    if (fs.existsSync(chatFile)) fs.unlinkSync(chatFile);
+    if (req.params.id === currentChatId) { currentChatId = generateChatId(); conversationHistory = []; }
+    res.json({ status: 'deleted' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/history', (req, res) => { res.json({ history: conversationHistory }); });
+
+app.delete('/api/history', (req, res) => {
+  saveChatToFile(currentChatId, conversationHistory);
+  currentChatId = generateChatId();
+  conversationHistory = [];
+  res.json({ status: 'cleared', newChatId: currentChatId });
+});
+
+// =============================================
+// EMOJIS
+// =============================================
+app.get('/api/emojis', (req, res) => {
+  const emojiDir = path.join(__dirname, 'public', 'emojis');
+  try {
+    if (fs.existsSync(emojiDir)) {
+      const files = fs.readdirSync(emojiDir).filter(f => /\.(png|gif|svg)$/i.test(f));
+      res.json({ emojis: files });
+    } else { res.json({ emojis: [] }); }
+  } catch (e) { res.json({ emojis: [] }); }
+});
+
+// =============================================
+// GIPHY
+// =============================================
+app.get('/api/gifs', async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.json({ results: [] });
+  if (!GIPHY_KEY) return res.json({ results: [] });
+  try {
+    const url = `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_KEY}&q=${encodeURIComponent(q)}&limit=12&rating=r`;
+    console.log(`  [GIF] Searching: "${q}"`);
+    const response = await fetch(url);
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`  [GIF] API error ${response.status}:`, errText);
+      return res.json({ results: [] });
+    }
+    const data = await response.json();
+    console.log(`  [GIF] Got ${(data.data || []).length} results`);
+    const results = (data.data || []).map(g => ({
+      id: g.id,
+      url: g.images?.original?.url || g.images?.fixed_height?.url,
+      preview: g.images?.fixed_height_small?.url || g.images?.fixed_height?.url,
+      width: parseInt(g.images?.original?.width) || 200,
+      height: parseInt(g.images?.original?.height) || 200
+    }));
+    res.json({ results });
+  } catch (e) {
+    console.error('  [GIF] Error:', e.message);
+    res.json({ results: [] });
+  }
+});
+
+// =============================================
+// TOOLS (debug endpoint)
+// =============================================
+app.get('/api/tools', (req, res) => {
+  const connectors = mcpManager.clients.map(c => ({
+    label: c.label,
+    connected: c.client.connected,
+    count: c.client.tools.length,
+    tools: c.client.tools.map(t => ({ name: t.name, description: (t.description || '').substring(0, 100) }))
+  }));
+  res.json({
+    connected: mcpManager.connected,
+    totalTools: mcpManager.tools.length,
+    connectors
+  });
+});
+
+// =============================================
+// SPA FALLBACK
+// =============================================
+app.get('/{*splat}', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(PORT, async () => {
+  console.log('');
+  console.log('  ╔══════════════════════════════════════╗');
+  console.log('  ║          V A L E   H O U S E         ║');
+  console.log('  ║          he\'s already here            ║');
+  console.log('  ╠══════════════════════════════════════╣');
+  const portStr = `http://localhost:${PORT}`;
+  console.log(`  ║  Local:  ${portStr.padEnd(25)}║`);
+  console.log('  ║  Live:   house.valeverse.party       ║');
+  console.log('  ╠══════════════════════════════════════╣');
+  console.log(`  ║  Model:  ${currentModel.padEnd(25)}║`);
+  console.log(`  ║  API:    ${ANTHROPIC_KEY ? '✓ connected' : '✗ missing'}                ║`);
+  console.log(`  ║  Giphy:  ${GIPHY_KEY ? '✓ connected' : '✗ missing'}                ║`);
+
+  // Connect all MCP connectors
+  console.log('  ╠══════════════════════════════════════╣');
+  if (mcpManager.clients.length > 0) {
+    const results = await mcpManager.connectAll();
+    for (const r of results) {
+      const lbl = r.label.padEnd(14).substring(0, 14);
+      const status = r.ok ? `✓ ${r.count} tools` : '✗ failed';
+      const line = `  ║  ${lbl} ${status}`;
+      console.log(line.padEnd(40) + '║');
+    }
+    const totalLine = `  ║  ── Total: ${mcpManager.tools.length} tools`;
+    console.log(totalLine.padEnd(40) + '║');
+  } else {
+    console.log('  ║  MCP: ✗ no connectors configured    ║');
+  }
+
+  console.log('  ╚══════════════════════════════════════╝');
+  console.log('');
+  console.log('  Lincoln is awake. Waiting for Arden.');
+  console.log('');
+});
