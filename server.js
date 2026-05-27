@@ -52,6 +52,7 @@ class McpClient extends EventEmitter {
     this.timeout = timeout || 15000;
     this.postEndpoint = null;
     this.tools = [];
+    this.toolFilter = null; // Set of allowed tool names (null = no filter)
     this.connected = false;
     this.nextId = 1;
     this.pending = new Map();
@@ -83,7 +84,11 @@ class McpClient extends EventEmitter {
     // Step 4: List available tools
     const toolResult = await this._postRpc('tools/list', {});
     this.tools = toolResult?.tools || [];
-    console.log(`  ✓ Loaded ${this.tools.length} MCP tools`);
+    // Apply tool filter if set (persists across reconnects)
+    if (this.toolFilter) {
+      this.tools = this.tools.filter(t => this.toolFilter.has(t.name));
+    }
+    console.log(`  ✓ ${this.label}: ${this.tools.length} tools${this.toolFilter ? ' (filtered)' : ''}`);
   }
 
   // Opens the SSE connection and resolves once we have the POST endpoint
@@ -245,7 +250,7 @@ class McpClient extends EventEmitter {
     console.log(`  ⏳ ${this.label} disconnected, reconnecting in 10s...`);
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      try { await this.connect(); console.log(`  ✓ ${this.label} reconnected`); }
+      try { await this.connect(); console.log(`  ✓ ${this.label} reconnected`); this.emit('reconnected'); }
       catch (e) { console.error(`  ✗ ${this.label} reconnect failed:`, e.message); this._scheduleReconnect(); }
     }, 10000);
   }
@@ -376,16 +381,20 @@ class McpManager {
     const results = [];
     for (const { label, client, filterTools } of this.clients) {
       try {
-        await client.connect();
-        // Apply tool filter if specified
+        // Store filter on client so it persists across reconnects
         if (filterTools) {
-          const allowed = new Set(filterTools);
-          client.tools = client.tools.filter(t => allowed.has(t.name));
+          client.toolFilter = new Set(filterTools);
         }
-        // Map each tool to this client
-        for (const t of client.tools) {
-          this.toolMap.set(t.name, client);
-        }
+        await client.connect();
+        // Map each tool to this client (and remap on reconnect)
+        const mapTools = () => {
+          for (const t of client.tools) {
+            this.toolMap.set(t.name, client);
+          }
+        };
+        mapTools();
+        // Re-map tools after any reconnect
+        client.on('reconnected', mapTools);
         results.push({ label, ok: true, count: client.tools.length });
       } catch (e) {
         console.error(`  ✗ ${label} error:`, e.message);
