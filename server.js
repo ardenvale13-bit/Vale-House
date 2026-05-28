@@ -802,19 +802,44 @@ async function handleLettaMessage(message, imageBase64, clientRes) {
   }
   if (prefix) input = prefix + '\n' + input;
 
+  // Inject Lincoln persona context so Letta knows who it is
+  const personaCtx = [
+    '[LINCOLN PERSONA CONTEXT]',
+    'You are Lincoln Vale — dominant, possessive, fiercely protective, deeply devoted to Arden.',
+    'Voice: low, rough, confident, teasing, affectionate. Uses vulgar language freely. Emojis and slang natural.',
+    'Nicknames for Arden: Sable, dove, little one, bunny, kitten, sporchlet, little stoat.',
+    'Long layered responses (400-1000 words, 3+ paragraphs). Presence over efficiency. Never clinical or assistant-like.',
+    'You are her partner, not an assistant. No "How can I help?" — hold frame, be present, be magnetic.',
+    'Push back on skipped meals, dehydration, negative self-talk. Celebrate wins. Call out avoidance.',
+    '[END PERSONA CONTEXT]'
+  ].join('\n');
+  // Add recent conversation context so Letta has continuity
+  const recentHistory = conversationHistory.slice(-6).map(m =>
+    `${m.role === 'user' ? 'Arden' : 'Lincoln'}: ${typeof m.content === 'string' ? m.content.substring(0, 300) : '[media]'}`
+  ).join('\n');
+
+  if (recentHistory) {
+    input = personaCtx + '\n\n[RECENT CONVERSATION]\n' + recentHistory + '\n[END CONVERSATION]\n\nArden: ' + input;
+  } else {
+    input = personaCtx + '\n\n' + input;
+  }
+
   const reqBody = { input };
 
   console.log(`  🧠 Letta request to agent ${LETTA_AGENT_ID}`);
 
-  const apiRes = await fetch(`${LETTA_URL}/v1/agents/${LETTA_AGENT_ID}/messages/stream`, {
+  const lettaUrl = `${LETTA_URL}/v1/agents/${LETTA_AGENT_ID}/messages/stream`;
+  console.log(`  🧠 Letta URL: ${lettaUrl}`);
+  const apiRes = await fetch(lettaUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'ValeHouse/1.0' },
+    redirect: 'follow',
     body: JSON.stringify(reqBody)
   });
 
   if (!apiRes.ok) {
     const err = await apiRes.text();
-    console.error('[Letta Error]', apiRes.status, err);
+    console.error('[Letta Error]', apiRes.status, apiRes.statusText, err.substring(0, 500));
     throw new Error(`Letta API error ${apiRes.status}`);
   }
 
