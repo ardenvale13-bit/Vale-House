@@ -32,14 +32,18 @@ const AVAILABLE_MODELS = [
   { id: 'claude-opus-4-5-20251101', label: 'Opus 4.5', tier: 'opus', cost: '$5/$25' },
   { id: 'claude-opus-4-6', label: 'Opus 4.6', tier: 'opus', cost: '$5/$25' },
   { id: 'claude-opus-4-7', label: 'Opus 4.7', tier: 'opus', cost: '$5/$25' },
-  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', tier: 'haiku', cost: '$1/$5' }
+  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', tier: 'haiku', cost: '$1/$5' },
+  { id: 'letta', label: 'Letta (Free)', tier: 'letta', cost: '$0' }
 ];
 const VALE_HUB_URL = env.VALE_HUB_URL || process.env.VALE_HUB_URL;
 const COMPANONION_URL = env.COMPANONION_URL || process.env.COMPANONION_URL;
 const VIDEO_MCP_URL = env.VIDEO_MCP_URL || process.env.VIDEO_MCP_URL;
 const GAMES_MCP_URL = env.GAMES_MCP_URL || process.env.GAMES_MCP_URL;
+const LETTA_URL = env.LETTA_URL || process.env.LETTA_URL || 'http://localhost:8283';
+const LETTA_AGENT_ID = env.LETTA_AGENT_ID || process.env.LETTA_AGENT_ID;
 
 if (!ANTHROPIC_KEY) { console.error('  ⚠ No ANTHROPIC_API_KEY in .env — messaging will fail'); }
+if (LETTA_AGENT_ID) { console.log(`  🧠 Letta agent configured: ${LETTA_AGENT_ID}`); }
 
 // =============================================
 // MCP CLIENT (SSE Transport)
@@ -586,7 +590,7 @@ app.get('/api/health', (req, res) => {
 // MODEL SWITCHING
 // =============================================
 app.get('/api/model', (req, res) => {
-  res.json({ model: currentModel, available: AVAILABLE_MODELS });
+  res.json({ model: currentModel, available: AVAILABLE_MODELS, lettaAvailable, lettaAgentId: LETTA_AGENT_ID || null });
 });
 
 app.post('/api/model', (req, res) => {
@@ -701,11 +705,193 @@ async function executeToolCalls(toolCalls, clientRes) {
   return results;
 }
 
+// =============================================
+// CLAUDE PROVIDER
+// =============================================
+async function handleClaudeMessage(history, message, image, clientRes, onComplete) {
+  let apiMessages = buildMessages(history.slice(0, -1), message || '*sent an image*', image);
+  const tools = mcpManager.connected ? mcpManager.getAnthropicTools() : [];
+  let fullResponse = '';
+  const MAX_TOOL_ROUNDS = 10;
+
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const reqBody = {
+      model: currentModel === 'letta' ? CLAUDE_MODEL_DEFAULT : currentModel,
+      max_tokens: 4096,
+      system: SYSTEM_PROMPT,
+      stream: true,
+      messages: apiMessages
+    };
+    if (tools.length > 0) reqBody.tools = tools;
+
+    const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify(reqBody)
+    });
+
+    if (!apiRes.ok) {
+      const err = await apiRes.text();
+      console.error('[API Error]', apiRes.status, err);
+      clientRes.write(`data: ${JSON.stringify({ type: 'error', error: `API error ${apiRes.status}` })}\n\n`);
+      break;
+    }
+
+    const { textContent, toolCalls, stopReason } = await parseAnthropicStream(apiRes, clientRes);
+    fullResponse += textContent;
+
+    if (stopReason !== 'tool_use' || toolCalls.length === 0 || !mcpManager.connected) {
+      const responseTimestamp = new Date().toISOString();
+      clientRes.write(`data: ${JSON.stringify({ type: 'done', timestamp: responseTimestamp })}\n\n`);
+      break;
+    }
+
+    const assistantContent = [];
+    if (textContent) assistantContent.push({ type: 'text', text: textContent });
+    toolCalls.forEach(tc => {
+      assistantContent.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.input });
+    });
+    apiMessages.push({ role: 'assistant', content: assistantContent });
+
+    const toolResults = await executeToolCalls(toolCalls, clientRes);
+    apiMessages.push({ role: 'user', content: toolResults });
+
+    console.log(`  ↻ Tool round ${round + 1} complete, continuing...`);
+  }
+
+  onComplete(fullResponse);
+}
+
+// =============================================
+// LETTA PROVIDER
+// =============================================
+let lettaAvailable = false;
+
+async function checkLettaHealth() {
+  if (!LETTA_AGENT_ID) { lettaAvailable = false; return false; }
+  try {
+    const r = await fetch(`${LETTA_URL}/v1/health`, { signal: AbortSignal.timeout(3000) });
+    lettaAvailable = r.ok;
+  } catch { lettaAvailable = false; }
+  return lettaAvailable;
+}
+
+// Check Letta on startup and every 30s
+if (LETTA_AGENT_ID) {
+  checkLettaHealth();
+  setInterval(checkLettaHealth, 30000);
+}
+
+async function handleLettaMessage(message, imageBase64, clientRes) {
+  // Build input — for images, just send the text (Letta on ChatGPT Plus may not support images well)
+  let input = message || '';
+
+  // Add Arden's presence context
+  let prefix = '';
+  if (ardenPresence.status || ardenPresence.mood) {
+    prefix += `[ARDEN STATUS: ${ardenPresence.status}`;
+    if (ardenPresence.mood) prefix += ` | Mood: ${ardenPresence.mood}`;
+    prefix += ']\n';
+  }
+  if (imageBase64) {
+    prefix += '[Arden sent an image, but Letta provider cannot process images. Acknowledge you received it.]\n';
+  }
+  if (prefix) input = prefix + '\n' + input;
+
+  const reqBody = {
+    input,
+    streaming: true,
+    stream_tokens: true,
+    include_return_message_types: ['assistant_message', 'tool_call_message', 'tool_return_message', 'reasoning_message', 'usage_statistics']
+  };
+
+  console.log(`  🧠 Letta request to agent ${LETTA_AGENT_ID}`);
+
+  const apiRes = await fetch(`${LETTA_URL}/v1/agents/${LETTA_AGENT_ID}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(reqBody)
+  });
+
+  if (!apiRes.ok) {
+    const err = await apiRes.text();
+    console.error('[Letta Error]', apiRes.status, err);
+    throw new Error(`Letta API error ${apiRes.status}`);
+  }
+
+  // Parse Letta's SSE stream and map to Vale House events
+  const reader = apiRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullText = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (!data || data === '[DONE]') continue;
+
+      try {
+        const event = JSON.parse(data);
+        const msgType = event.message_type;
+
+        if (msgType === 'assistant_message') {
+          // Extract text content
+          let text = '';
+          if (typeof event.content === 'string') {
+            text = event.content;
+          } else if (Array.isArray(event.content)) {
+            text = event.content.filter(c => c.type === 'text').map(c => c.text).join('');
+          }
+          if (text && text !== fullText) {
+            // Send the new portion as a delta
+            const delta = text.slice(fullText.length);
+            if (delta) {
+              clientRes.write(`data: ${JSON.stringify({ type: 'delta', text: delta })}\n\n`);
+              fullText = text;
+            }
+          }
+        }
+
+        if (msgType === 'tool_call_message') {
+          const toolName = event.tool_call?.name || event.tool_calls?.[0]?.name || 'unknown';
+          clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: `letta:${toolName}`, status: 'calling' })}\n\n`);
+        }
+
+        if (msgType === 'tool_return_message') {
+          const toolName = event.tool_returns?.[0]?.tool_call_id || 'tool';
+          clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: `letta:${toolName}`, status: 'done' })}\n\n`);
+        }
+
+        if (msgType === 'reasoning_message') {
+          // Could show thinking indicator — skip for now, Letta handles internally
+        }
+
+      } catch (e) { /* skip unparseable */ }
+    }
+  }
+
+  return fullText;
+}
+
 app.post('/api/message', async (req, res) => {
   const { message, image } = req.body;
   console.log(`  📩 Message received — text: ${(message||'').substring(0,50)}, image: ${image ? `yes (${image.length} chars)` : 'no'}`);
   if ((!message || !message.trim()) && !image) return res.status(400).json({ error: 'Empty message' });
-  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'No API key configured' });
+  const isLetta = currentModel === 'letta';
+  if (!isLetta && !ANTHROPIC_KEY) return res.status(500).json({ error: 'No API key configured' });
+  if (isLetta && !LETTA_AGENT_ID) return res.status(500).json({ error: 'No Letta agent configured' });
 
   // Set up SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
@@ -720,65 +906,29 @@ app.post('/api/message', async (req, res) => {
     conversationHistory.push({ role: 'user', content: message || '*sent an image*', timestamp, reactions: [], seen: true, hasImage: !!image });
     if (conversationHistory.length > MAX_HISTORY) conversationHistory = conversationHistory.slice(-MAX_HISTORY);
 
-    // Build the API messages
-    let apiMessages = buildMessages(conversationHistory.slice(0, -1), message || '*sent an image*', image);
-
-    // Get all MCP tools if connected
-    const tools = mcpManager.connected ? mcpManager.getAnthropicTools() : [];
-
     let fullResponse = '';
-    const MAX_TOOL_ROUNDS = 10;
 
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-      const reqBody = {
-        model: currentModel,
-        max_tokens: 4096,
-        system: SYSTEM_PROMPT,
-        stream: true,
-        messages: apiMessages
-      };
-      if (tools.length > 0) reqBody.tools = tools;
-
-      const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': ANTHROPIC_KEY,
-          'anthropic-version': '2023-06-01'
-        },
-        body: JSON.stringify(reqBody)
-      });
-
-      if (!apiRes.ok) {
-        const err = await apiRes.text();
-        console.error('[API Error]', apiRes.status, err);
-        res.write(`data: ${JSON.stringify({ type: 'error', error: `API error ${apiRes.status}` })}\n\n`);
-        break;
-      }
-
-      const { textContent, toolCalls, stopReason } = await parseAnthropicStream(apiRes, res);
-      fullResponse += textContent;
-
-      // If no tool calls or stop reason isn't tool_use, we're done
-      if (stopReason !== 'tool_use' || toolCalls.length === 0 || !mcpManager.connected) {
+    if (isLetta) {
+      // ── LETTA PROVIDER ──
+      try {
+        fullResponse = await handleLettaMessage(message, image, res);
         const responseTimestamp = new Date().toISOString();
         res.write(`data: ${JSON.stringify({ type: 'done', timestamp: responseTimestamp })}\n\n`);
-        break;
+      } catch (lettaErr) {
+        console.error('[Letta Error]', lettaErr.message);
+        // Auto-fallback to Claude if Letta fails and we have a key
+        if (ANTHROPIC_KEY) {
+          console.log('  ↻ Letta failed, falling back to Claude...');
+          res.write(`data: ${JSON.stringify({ type: 'tool', name: 'system', status: 'calling', error: 'Letta unavailable — falling back to Claude' })}\n\n`);
+          // Fall through to Claude path below
+          await handleClaudeMessage(conversationHistory, message, image, res, (text) => { fullResponse = text; });
+        } else {
+          res.write(`data: ${JSON.stringify({ type: 'error', error: lettaErr.message })}\n\n`);
+        }
       }
-
-      // Build the assistant message with both text and tool_use blocks
-      const assistantContent = [];
-      if (textContent) assistantContent.push({ type: 'text', text: textContent });
-      toolCalls.forEach(tc => {
-        assistantContent.push({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.input });
-      });
-      apiMessages.push({ role: 'assistant', content: assistantContent });
-
-      // Execute tools and add results
-      const toolResults = await executeToolCalls(toolCalls, res);
-      apiMessages.push({ role: 'user', content: toolResults });
-
-      console.log(`  ↻ Tool round ${round + 1} complete, continuing...`);
+    } else {
+      // ── CLAUDE PROVIDER ──
+      await handleClaudeMessage(conversationHistory, message, image, res, (text) => { fullResponse = text; });
     }
 
     // Save the final text response to conversation history

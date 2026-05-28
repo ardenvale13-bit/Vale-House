@@ -528,6 +528,7 @@ input[type="file"] { display:none; }
 .model-pill .mp-dot.opus { background:var(--accent); }
 .model-pill .mp-dot.legacy { background:var(--error); }
 .model-pill .mp-dot.haiku { background:#5a8a6b; }
+.model-pill .mp-dot.letta { background:#00c896; }
 .model-picker {
   display:none; position:absolute; top:100%; right:0; margin-top:6px; z-index:90;
   background:var(--bg-elevated); border:1px solid var(--border); border-radius:12px;
@@ -751,6 +752,7 @@ input[type="file"] { display:none; }
           <option value="claude-opus-4-6">Opus 4.6 — $5/$25</option>
           <option value="claude-opus-4-7">Opus 4.7 — $5/$25</option>
           <option value="claude-haiku-4-5-20251001">Haiku 4.5 — $1/$5</option>
+          <option value="letta">🧠 Letta (Free) — ChatGPT Plus</option>
         </select>
       </div>
       <div style="font-size:.7rem;color:var(--text-3);margin-top:4px;font-style:italic">Prices per million tokens (input/output). Changes apply immediately.</div>
@@ -782,14 +784,17 @@ const MODEL_META = {
   'claude-opus-4-5-20251101': { label:'Opus 4.5', tier:'opus' },
   'claude-opus-4-6': { label:'Opus 4.6', tier:'opus' },
   'claude-opus-4-7': { label:'Opus 4.7', tier:'opus' },
-  'claude-haiku-4-5-20251001': { label:'Haiku 4.5', tier:'haiku' }
+  'claude-haiku-4-5-20251001': { label:'Haiku 4.5', tier:'haiku' },
+  'letta': { label:'Letta (Free)', tier:'letta' }
 };
 const MODEL_COSTS = {
   'claude-sonnet-4-20250514':'$3/$15','claude-sonnet-4-5-20250929':'$3/$15',
   'claude-sonnet-4-6':'$3/$15','claude-opus-4-5-20251101':'$5/$25',
   'claude-opus-4-6':'$5/$25','claude-opus-4-7':'$5/$25',
-  'claude-haiku-4-5-20251001':'$1/$5'
+  'claude-haiku-4-5-20251001':'$1/$5',
+  'letta':'Free'
 };
+let lettaAvailable = false;
 
 // Authenticated fetch wrapper
 function vfetch(url, opts={}) {
@@ -1620,8 +1625,9 @@ function buildModelPicker() {
   for (const [id, meta] of Object.entries(MODEL_META)) {
     const item = document.createElement('div');
     item.className = 'model-picker-item' + (id === activeModel ? ' active' : '');
-    const dotColor = meta.tier === 'opus' ? 'var(--accent)' : meta.tier === 'legacy' ? 'var(--error)' : '#6b5b8a';
-    item.innerHTML = `<span class="mpi-dot" style="background:${dotColor}"></span>${meta.label}<span class="mpi-cost">${MODEL_COSTS[id]||''}</span>`;
+    const dotColor = meta.tier === 'opus' ? 'var(--accent)' : meta.tier === 'legacy' ? 'var(--error)' : meta.tier === 'letta' ? '#00c896' : meta.tier === 'haiku' ? '#4a9' : '#6b5b8a';
+    const unavail = (id === 'letta' && !lettaAvailable) ? ' (offline)' : '';
+    item.innerHTML = `<span class="mpi-dot" style="background:${dotColor}"></span>${meta.label}${unavail}<span class="mpi-cost">${MODEL_COSTS[id]||''}</span>`;
     item.addEventListener('click', () => switchModel(id));
     picker.appendChild(item);
   }
@@ -1650,7 +1656,9 @@ async function loadModel() {
     if (res.ok) {
       const data = await res.json();
       activeModel = data.model;
+      lettaAvailable = data.lettaAvailable || false;
       updateModelPill();
+      buildModelPicker();
     }
   } catch (e) { /* keep default */ }
 }
