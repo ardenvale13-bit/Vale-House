@@ -937,9 +937,35 @@ app.post('/api/message', async (req, res) => {
       await handleClaudeMessage(conversationHistory, message, image, res, (text) => { fullResponse = text; });
     }
 
+    // Resolve [GIF:query] shorthand into actual Giphy URLs
+    if (fullResponse.includes('[GIF:')) {
+      const gifPattern = /\[GIF:([^\]]+)\]/g;
+      let match;
+      while ((match = gifPattern.exec(fullResponse)) !== null) {
+        const query = match[1].trim();
+        if (GIPHY_KEY) {
+          try {
+            const giphyUrl = `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_KEY}&q=${encodeURIComponent(query)}&limit=1&rating=r`;
+            const gRes = await fetch(giphyUrl);
+            if (gRes.ok) {
+              const gData = await gRes.json();
+              const gif = gData.data?.[0];
+              if (gif) {
+                const gifUrl = gif.images?.original?.url || gif.images?.fixed_height?.url;
+                fullResponse = fullResponse.replace(match[0], `[GIF](${gifUrl})`);
+                console.log(`  [GIF] Resolved "${query}" → ${gifUrl}`);
+              }
+            }
+          } catch (e) {
+            console.log(`  [GIF] Failed to resolve "${query}": ${e.message}`);
+          }
+        }
+      }
+    }
+
     // Save the final text response to conversation history
-    const responseTimestamp = new Date().toISOString();
-    conversationHistory.push({ role: 'assistant', content: fullResponse, timestamp: responseTimestamp, reactions: [], seen: false });
+    const finalTimestamp = new Date().toISOString();
+    conversationHistory.push({ role: 'assistant', content: fullResponse, timestamp: finalTimestamp, reactions: [], seen: false });
     saveChatToFile(currentChatId, conversationHistory);
     orientedThisChat = true;
 
