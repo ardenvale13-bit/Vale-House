@@ -41,6 +41,7 @@ const VIDEO_MCP_URL = env.VIDEO_MCP_URL || process.env.VIDEO_MCP_URL;
 const GAMES_MCP_URL = env.GAMES_MCP_URL || process.env.GAMES_MCP_URL;
 const LETTA_URL = env.LETTA_URL || process.env.LETTA_URL || 'http://localhost:8283';
 const LETTA_AGENT_ID = env.LETTA_AGENT_ID || process.env.LETTA_AGENT_ID;
+const LETTA_CONVERSATION_ID = env.LETTA_CONVERSATION_ID || process.env.LETTA_CONVERSATION_ID;
 
 if (!ANTHROPIC_KEY) { console.error('  ⚠ No ANTHROPIC_API_KEY in .env — messaging will fail'); }
 if (LETTA_AGENT_ID) { console.log(`  🧠 Letta agent configured: ${LETTA_AGENT_ID}`); }
@@ -824,11 +825,21 @@ async function handleLettaMessage(message, imageBase64, clientRes) {
     input = personaCtx + '\n\n' + input;
   }
 
-  const reqBody = { input };
+  // Use conversation endpoint if available, otherwise fall back to agent endpoint
+  let lettaUrl, reqBody;
+  if (LETTA_CONVERSATION_ID) {
+    lettaUrl = `${LETTA_URL}/v1/conversations/${LETTA_CONVERSATION_ID}/messages/stream`;
+    reqBody = {
+      messages: [{ role: 'user', content: input }],
+      stream_tokens: true
+    };
+    console.log(`  🧠 Letta conversation: ${LETTA_CONVERSATION_ID}`);
+  } else {
+    lettaUrl = `${LETTA_URL}/v1/agents/${LETTA_AGENT_ID}/messages/stream`;
+    reqBody = { input };
+    console.log(`  🧠 Letta agent (no conversation): ${LETTA_AGENT_ID}`);
+  }
 
-  console.log(`  🧠 Letta request to agent ${LETTA_AGENT_ID}`);
-
-  const lettaUrl = `${LETTA_URL}/v1/agents/${LETTA_AGENT_ID}/messages/stream`;
   console.log(`  🧠 Letta URL: ${lettaUrl}`);
   const apiRes = await fetch(lettaUrl, {
     method: 'POST',
