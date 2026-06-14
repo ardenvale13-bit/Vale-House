@@ -788,40 +788,46 @@ if (LETTA_AGENT_ID) {
 }
 
 async function handleLettaMessage(message, imageBase64, clientRes) {
-  // Build input — for images, just send the text (Letta on ChatGPT Plus may not support images well)
   let input = message || '';
 
-  // Add Arden's presence context
-  let prefix = '';
-  if (ardenPresence.status || ardenPresence.mood) {
-    prefix += `[ARDEN STATUS: ${ardenPresence.status}`;
-    if (ardenPresence.mood) prefix += ` | Mood: ${ardenPresence.mood}`;
-    prefix += ']\n';
-  }
+  // Build the request body — try multimodal if image present
+  let reqBody;
   if (imageBase64) {
-    prefix += '[Arden sent an image, but Letta provider cannot process images. Acknowledge you received it.]\n';
+    // Try sending image as multimodal content via messages array
+    const contentParts = [];
+    if (input) contentParts.push({ type: 'text', text: input });
+    contentParts.push({
+      type: 'image_url',
+      image_url: { url: `data:image/jpeg;base64,${imageBase64}` }
+    });
+    reqBody = {
+      messages: [{ role: 'user', content: contentParts }]
+    };
+    console.log('  🧠 Letta: sending multimodal message with image');
+  } else {
+    reqBody = { input };
   }
-  if (prefix) input = prefix + '\n' + input;
-
-  // Add recent conversation history for continuity (persona comes from Letta's own memory blocks)
-  const recentHistory = conversationHistory.slice(-6).map(m =>
-    `${m.role === 'user' ? 'Arden' : 'Lincoln'}: ${typeof m.content === 'string' ? m.content.substring(0, 300) : '[media]'}`
-  ).join('\n');
-
-  if (recentHistory) {
-    input = '[Recent messages]\n' + recentHistory + '\n[Current message]\nArden: ' + input;
-  }
-
-  const reqBody = { input };
   const lettaUrl = `${LETTA_URL}/v1/agents/${LETTA_AGENT_ID}/messages/stream`;
   console.log(`  🧠 Letta request to agent ${LETTA_AGENT_ID}`);
   console.log(`  🧠 Letta URL: ${lettaUrl}`);
-  const apiRes = await fetch(lettaUrl, {
+  let apiRes = await fetch(lettaUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': 'ValeHouse/1.0' },
     redirect: 'follow',
     body: JSON.stringify(reqBody)
   });
+
+  // If multimodal failed, retry with text-only
+  if (!apiRes.ok && imageBase64) {
+    console.log('  🧠 Letta: multimodal failed, retrying text-only');
+    const textOnly = input || 'Arden sent you a photo';
+    apiRes = await fetch(lettaUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'ValeHouse/1.0' },
+      redirect: 'follow',
+      body: JSON.stringify({ input: textOnly })
+    });
+  }
 
   if (!apiRes.ok) {
     const err = await apiRes.text();
