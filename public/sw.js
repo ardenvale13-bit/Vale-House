@@ -1,4 +1,4 @@
-const CACHE_NAME = 'vale-house-v9';
+const CACHE_NAME = 'vale-house-v10';
 const STATIC_ASSETS = [
   '/',
   '/index.html',

@@ -55,35 +55,29 @@ async function syncBlock(label, filePath) {
   console.log(`📤 Syncing ${label} (${content.length} chars)...`);
   console.log(`   Preview: ${content.substring(0, 100)}...`);
 
-  const endpoints = [
-    { path: `agents/${LETTA_AGENT_ID}/core-memory/blocks/${label}`, body: { value: content } },
-    { path: `agents/${LETTA_AGENT_ID}/memory/blocks/${label}`, body: { value: content } },
-    { path: `agents/${LETTA_AGENT_ID}/memory`, body: { [label]: content } },
-  ];
-
   const headers = { 'Content-Type': 'application/json' };
   if (LETTA_API_KEY) headers['Authorization'] = `Bearer ${LETTA_API_KEY}`;
 
-  for (const ep of endpoints) {
-    const url = `${LETTA_URL}/v1/${ep.path}`;
-    try {
-      const res = await fetch(url, {
-        method: 'PATCH',
-        headers,
-        body: JSON.stringify(ep.body),
-      });
-      if (res.ok) {
-        console.log(`✅ ${label} synced via /v1/${ep.path}`);
-        return true;
-      }
-      console.log(`   /v1/${ep.path} → ${res.status}`);
-    } catch (e) {
-      console.log(`   /v1/${ep.path} → ${e.message}`);
-    }
-  }
+  try {
+    const agentRes = await fetch(`${LETTA_URL.replace(/\/$/, '')}/v1/agents/${LETTA_AGENT_ID}`, { headers });
+    if (!agentRes.ok) throw new Error(`Agent lookup failed (${agentRes.status})`);
+    const agent = await agentRes.json();
+    const blocks = agent.blocks || agent.memory?.blocks || [];
+    const block = blocks.find(candidate => candidate.label === label);
+    if (!block?.id) throw new Error(`Agent has no "${label}" memory block`);
 
-  console.error(`❌ ${label}: all endpoints failed`);
-  return false;
+    const res = await fetch(`${LETTA_URL.replace(/\/$/, '')}/v1/blocks/${block.id}`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ value: content }),
+    });
+    if (!res.ok) throw new Error(`Block update failed (${res.status}): ${(await res.text()).substring(0, 200)}`);
+    console.log(`✅ ${label} synced`);
+    return true;
+  } catch (e) {
+    console.error(`❌ ${label}: ${e.message}`);
+    return false;
+  }
 }
 
 async function main() {
@@ -92,13 +86,19 @@ async function main() {
   console.log(`   Agent: ${LETTA_AGENT_ID}`);
   console.log(`   Memory dir: ${AGENT_DIR}\n`);
 
-  // First check health
+  // Verify that the configured agent is reachable.
   try {
-    const h = await fetch(`${LETTA_URL}/v1/health`, { signal: AbortSignal.timeout(3000) });
+    const headers = {};
+    if (LETTA_API_KEY) headers.Authorization = `Bearer ${LETTA_API_KEY}`;
+    const h = await fetch(`${LETTA_URL.replace(/\/$/, '')}/v1/agents/${LETTA_AGENT_ID}`, {
+      headers,
+      signal: AbortSignal.timeout(5000)
+    });
     console.log(`   Health: ${h.status} ${h.ok ? '✅' : '❌'}\n`);
+    if (!h.ok) process.exit(1);
   } catch (e) {
     console.log(`   Health: unreachable (${e.message})\n`);
-    console.log('   Is your Cloudflare tunnel running? Is Letta Code open?');
+    console.log('   Check LETTA_URL, LETTA_AGENT_ID, and LETTA_API_KEY.');
     process.exit(1);
   }
 
@@ -113,8 +113,7 @@ async function main() {
     for (const { label, file } of blocks) {
       console.log(`   ${label}: ${fs.existsSync(file) ? '✓ exists' : '✗ missing'} — ${file}`);
     }
-    console.log('\nIf files exist, Letta may not expose PATCH on this port.');
-    console.log('Update persona directly in Letta Code UI instead.');
+    console.log('\nCheck that the hosted agent contains persona and human memory blocks.');
   } else {
     console.log(`\n✅ ${ok}/${blocks.length} blocks synced. Test with a message now.`);
   }

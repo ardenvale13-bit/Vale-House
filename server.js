@@ -20,7 +20,11 @@ if (fs.existsSync(ENV_FILE)) {
   });
 }
 
-const API_TOKEN = env.VALE_TOKEN || process.env.VALE_TOKEN || crypto.randomBytes(32).toString('hex');
+const CONFIGURED_API_TOKEN = env.VALE_TOKEN || process.env.VALE_TOKEN;
+if (process.env.NODE_ENV === 'production' && !CONFIGURED_API_TOKEN) {
+  throw new Error('VALE_TOKEN is required when NODE_ENV=production');
+}
+const API_TOKEN = CONFIGURED_API_TOKEN || crypto.randomBytes(32).toString('hex');
 const ANTHROPIC_KEY = env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
 const GIPHY_KEY = env.GIPHY_API_KEY || process.env.GIPHY_API_KEY;
 const CLAUDE_MODEL_DEFAULT = env.CLAUDE_MODEL || process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514';
@@ -41,7 +45,9 @@ const VIDEO_MCP_URL = env.VIDEO_MCP_URL || process.env.VIDEO_MCP_URL;
 const GAMES_MCP_URL = env.GAMES_MCP_URL || process.env.GAMES_MCP_URL;
 const LETTA_URL = env.LETTA_URL || process.env.LETTA_URL || 'http://localhost:8283';
 const LETTA_AGENT_ID = env.LETTA_AGENT_ID || process.env.LETTA_AGENT_ID;
+const LETTA_API_KEY = env.LETTA_API_KEY || process.env.LETTA_API_KEY || '';
 const LETTA_CONVERSATION_ID = env.LETTA_CONVERSATION_ID || process.env.LETTA_CONVERSATION_ID;
+const VALE_DATA_DIR = env.VALE_DATA_DIR || process.env.VALE_DATA_DIR || '';
 
 if (!ANTHROPIC_KEY) { console.error('  ⚠ No ANTHROPIC_API_KEY in .env — messaging will fail'); }
 if (LETTA_AGENT_ID) { console.log(`  🧠 Letta agent configured: ${LETTA_AGENT_ID}`); }
@@ -467,21 +473,26 @@ app.use(express.static(path.join(__dirname, 'public')));
 // AUTH
 // =============================================
 app.use('/api', (req, res, next) => {
-  if (req.path === '/health' || req.path === '/token') return next();
+  if (req.path === '/health') return next();
   const token = req.headers['x-vale-token'] || req.query.token;
   if (token !== API_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
   next();
 });
 
-app.get('/api/token', (req, res) => { res.json({ token: API_TOKEN }); });
+app.get('/api/auth', (req, res) => { res.json({ authenticated: true }); });
 
 // =============================================
 // CHAT STORAGE
 // =============================================
-const CHATS_DIR = path.join(__dirname, 'chats');
-const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
-if (!fs.existsSync(CHATS_DIR)) fs.mkdirSync(CHATS_DIR);
-if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR);
+const CHATS_DIR = VALE_DATA_DIR
+  ? path.join(VALE_DATA_DIR, 'chats')
+  : path.join(__dirname, 'chats');
+const UPLOADS_DIR = VALE_DATA_DIR
+  ? path.join(VALE_DATA_DIR, 'uploads')
+  : path.join(__dirname, 'public', 'uploads');
+if (!fs.existsSync(CHATS_DIR)) fs.mkdirSync(CHATS_DIR, { recursive: true });
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+if (VALE_DATA_DIR) app.use('/uploads', express.static(UPLOADS_DIR));
 
 let currentChatId = null;
 let conversationHistory = [];
@@ -772,10 +783,23 @@ async function handleClaudeMessage(history, message, image, clientRes, onComplet
 // =============================================
 let lettaAvailable = false;
 
+function lettaHeaders() {
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'ValeHouse/1.0'
+  };
+  if (LETTA_API_KEY) headers.Authorization = `Bearer ${LETTA_API_KEY}`;
+  return headers;
+}
+
 async function checkLettaHealth() {
   if (!LETTA_AGENT_ID) { lettaAvailable = false; return false; }
   try {
-    const r = await fetch(`${LETTA_URL}/v1/health`, { signal: AbortSignal.timeout(3000) });
+    // Retrieving the configured agent works for both Letta Cloud and self-hosted Letta.
+    const r = await fetch(`${LETTA_URL.replace(/\/$/, '')}/v1/agents/${LETTA_AGENT_ID}`, {
+      headers: lettaHeaders(),
+      signal: AbortSignal.timeout(5000)
+    });
     lettaAvailable = r.ok;
   } catch { lettaAvailable = false; }
   return lettaAvailable;
@@ -790,29 +814,33 @@ if (LETTA_AGENT_ID) {
 async function handleLettaMessage(message, imageBase64, clientRes) {
   let input = message || '';
 
-  // Build the request body — try multimodal if image present
-  let reqBody;
+  // Use the current create-message route. Letta keeps the agent's history server-side.
+  let content = input;
   if (imageBase64) {
-    // Try sending image as multimodal content via messages array
-    const contentParts = [];
-    if (input) contentParts.push({ type: 'text', text: input });
-    contentParts.push({
-      type: 'image_url',
-      image_url: { url: `data:image/jpeg;base64,${imageBase64}` }
+    content = [];
+    if (input) content.push({ type: 'text', text: input });
+    content.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: 'image/jpeg',
+        data: imageBase64.replace(/^data:image\/[^;]+;base64,/, '')
+      }
     });
-    reqBody = {
-      messages: [{ role: 'user', content: contentParts }]
-    };
     console.log('  🧠 Letta: sending multimodal message with image');
-  } else {
-    reqBody = { input };
   }
-  const lettaUrl = `${LETTA_URL}/v1/agents/${LETTA_AGENT_ID}/messages/stream`;
+  let reqBody = {
+    messages: [{ role: 'user', content }],
+    streaming: true,
+    stream_tokens: true,
+    include_pings: true
+  };
+  const lettaUrl = `${LETTA_URL.replace(/\/$/, '')}/v1/agents/${LETTA_AGENT_ID}/messages`;
   console.log(`  🧠 Letta request to agent ${LETTA_AGENT_ID}`);
   console.log(`  🧠 Letta URL: ${lettaUrl}`);
   let apiRes = await fetch(lettaUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': 'ValeHouse/1.0' },
+    headers: lettaHeaders(),
     redirect: 'follow',
     body: JSON.stringify(reqBody)
   });
@@ -823,9 +851,14 @@ async function handleLettaMessage(message, imageBase64, clientRes) {
     const textOnly = input || 'Arden sent you a photo';
     apiRes = await fetch(lettaUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'ValeHouse/1.0' },
+      headers: lettaHeaders(),
       redirect: 'follow',
-      body: JSON.stringify({ input: textOnly })
+      body: JSON.stringify({
+        messages: [{ role: 'user', content: textOnly }],
+        streaming: true,
+        stream_tokens: true,
+        include_pings: true
+      })
     });
   }
 
@@ -866,13 +899,10 @@ async function handleLettaMessage(message, imageBase64, clientRes) {
           } else if (Array.isArray(event.content)) {
             text = event.content.filter(c => c.type === 'text').map(c => c.text).join('');
           }
-          if (text && text !== fullText) {
-            // Send the new portion as a delta
-            const delta = text.slice(fullText.length);
-            if (delta) {
-              clientRes.write(`data: ${JSON.stringify({ type: 'delta', text: delta })}\n\n`);
-              fullText = text;
-            }
+          if (text) {
+            // Token streaming returns incremental pieces, so append each chunk.
+            clientRes.write(`data: ${JSON.stringify({ type: 'delta', text })}\n\n`);
+            fullText += text;
           }
         }
 

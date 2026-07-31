@@ -1,0 +1,9 @@
+node_modules
+.git
+.env
+chats
+public/uploads
+data
+*.log
+_orient_*
+.fuse_hidden*

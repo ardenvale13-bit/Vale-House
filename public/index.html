@@ -802,6 +802,33 @@ function vfetch(url, opts={}) {
   opts.headers['x-vale-token'] = VTOKEN;
   return fetch(url, opts);
 }
+
+async function ensureAuthenticated() {
+  VTOKEN = localStorage.getItem('vh-auth-token') || '';
+  if (VTOKEN) {
+    try {
+      const res = await vfetch(`${API}/api/auth`);
+      if (res.ok) return true;
+    } catch(e) {}
+    localStorage.removeItem('vh-auth-token');
+    VTOKEN = '';
+  }
+
+  const entered = window.prompt('Enter your Vale House access key');
+  if (!entered) return false;
+  VTOKEN = entered.trim();
+
+  try {
+    const res = await vfetch(`${API}/api/auth`);
+    if (!res.ok) throw new Error('Invalid access key');
+    localStorage.setItem('vh-auth-token', VTOKEN);
+    return true;
+  } catch(e) {
+    VTOKEN = '';
+    window.alert('That access key was not accepted.');
+    return false;
+  }
+}
 const $=id=>document.getElementById(id);
 const PFP='<img src="/profiles/lincoln.png" onerror="this.outerHTML=\'👑\'">';
 const REMOJI=['🖤','😂','🔥','💀','😏','🥺','💜','👑'];
@@ -820,8 +847,7 @@ function showScreen(id) {
    ============================================ */
 async function boot() {
   loadSettings();
-  // Grab auth token (served from same origin, no auth needed)
-  try { const r=await fetch(`${API}/api/token`); const d=await r.json(); VTOKEN=d.token; } catch(e){ console.warn('No token — running without auth'); }
+  await ensureAuthenticated();
   checkHealth().then(()=>{
     setTimeout(()=>{
       $('splash').classList.add('hide');
@@ -1463,7 +1489,7 @@ function setLincolnStatus(text) {
 function setConn(ok) {
   ['homeConn','chatConn'].forEach(id=>{
     $(id).className=ok?'conn-bar':'conn-bar off';
-    if(!ok) $(id).textContent='tunnel disconnected \u2014 is your PC on?';
+    if(!ok) $(id).textContent='Vale House is temporarily unreachable';
   });
 }
 
