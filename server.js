@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const { EventEmitter } = require('events');
+const { Letta } = require('@letta-ai/letta-client');
 
 const app = express();
 const PORT = process.env.PORT || 3333;
@@ -27,7 +28,7 @@ if (process.env.NODE_ENV === 'production' && !CONFIGURED_API_TOKEN) {
 const API_TOKEN = CONFIGURED_API_TOKEN || crypto.randomBytes(32).toString('hex');
 const ANTHROPIC_KEY = env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
 const GIPHY_KEY = env.GIPHY_API_KEY || process.env.GIPHY_API_KEY;
-const CLAUDE_MODEL_DEFAULT = env.CLAUDE_MODEL || process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514';
+const CLAUDE_MODEL_DEFAULT = env.CLAUDE_MODEL || process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 let currentModel = CLAUDE_MODEL_DEFAULT;
 const AVAILABLE_MODELS = [
   { id: 'claude-sonnet-4-20250514', label: 'Sonnet 4', tier: 'legacy', cost: '$3/$15' },
@@ -47,7 +48,12 @@ const LETTA_URL = env.LETTA_URL || process.env.LETTA_URL || 'http://localhost:82
 const LETTA_AGENT_ID = env.LETTA_AGENT_ID || process.env.LETTA_AGENT_ID;
 const LETTA_API_KEY = env.LETTA_API_KEY || process.env.LETTA_API_KEY || '';
 const LETTA_CONVERSATION_ID = env.LETTA_CONVERSATION_ID || process.env.LETTA_CONVERSATION_ID;
+const LETTA_FALLBACK_TO_CLAUDE = (env.LETTA_FALLBACK_TO_CLAUDE || process.env.LETTA_FALLBACK_TO_CLAUDE || '').toLowerCase() === 'true';
 const VALE_DATA_DIR = env.VALE_DATA_DIR || process.env.VALE_DATA_DIR || '';
+const lettaClient = new Letta({
+  baseURL: LETTA_URL.replace(/\/$/, ''),
+  apiKey: LETTA_API_KEY || null
+});
 
 if (!ANTHROPIC_KEY) { console.error('  ⚠ No ANTHROPIC_API_KEY in .env — messaging will fail'); }
 if (LETTA_AGENT_ID) { console.log(`  🧠 Letta agent configured: ${LETTA_AGENT_ID}`); }
@@ -829,98 +835,60 @@ async function handleLettaMessage(message, imageBase64, clientRes) {
     });
     console.log('  🧠 Letta: sending multimodal message with image');
   }
-  let reqBody = {
+  const reqBody = {
     messages: [{ role: 'user', content }],
     streaming: true,
     stream_tokens: true,
     include_pings: true
   };
-  const lettaUrl = `${LETTA_URL.replace(/\/$/, '')}/v1/agents/${LETTA_AGENT_ID}/messages`;
   console.log(`  🧠 Letta request to agent ${LETTA_AGENT_ID}`);
-  console.log(`  🧠 Letta URL: ${lettaUrl}`);
-  let apiRes = await fetch(lettaUrl, {
-    method: 'POST',
-    headers: lettaHeaders(),
-    redirect: 'follow',
-    body: JSON.stringify(reqBody)
-  });
+  console.log(`  🧠 Letta URL: ${LETTA_URL.replace(/\/$/, '')}`);
 
-  // If multimodal failed, retry with text-only
-  if (!apiRes.ok && imageBase64) {
+  let stream;
+  try {
+    stream = await lettaClient.agents.messages.create(LETTA_AGENT_ID, reqBody);
+  } catch (error) {
+    if (!imageBase64) throw error;
     console.log('  🧠 Letta: multimodal failed, retrying text-only');
     const textOnly = input || 'Arden sent you a photo';
-    apiRes = await fetch(lettaUrl, {
-      method: 'POST',
-      headers: lettaHeaders(),
-      redirect: 'follow',
-      body: JSON.stringify({
+    stream = await lettaClient.agents.messages.create(
+      LETTA_AGENT_ID,
+      {
         messages: [{ role: 'user', content: textOnly }],
         streaming: true,
         stream_tokens: true,
         include_pings: true
-      })
-    });
+      }
+    );
   }
 
-  if (!apiRes.ok) {
-    const err = await apiRes.text();
-    console.error('[Letta Error]', apiRes.status, apiRes.statusText, err.substring(0, 500));
-    throw new Error(`Letta API error ${apiRes.status}`);
-  }
-
-  // Parse Letta's SSE stream and map to Vale House events
-  const reader = apiRes.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+  // Map the official Letta SDK stream to Vale House events.
   let fullText = '';
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  for await (const event of stream) {
+    const msgType = event.message_type;
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop();
+    if (msgType === 'assistant_message') {
+      let text = '';
+      if (typeof event.content === 'string') {
+        text = event.content;
+      } else if (Array.isArray(event.content)) {
+        text = event.content.filter(c => c.type === 'text').map(c => c.text).join('');
+      }
+      if (text) {
+        clientRes.write(`data: ${JSON.stringify({ type: 'delta', text })}\n\n`);
+        fullText += text;
+      }
+    }
 
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const data = line.slice(6).trim();
-      if (!data || data === '[DONE]') continue;
+    if (msgType === 'tool_call_message') {
+      const toolName = event.tool_call?.name || event.tool_calls?.[0]?.name || 'unknown';
+      clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: `letta:${toolName}`, status: 'calling' })}\n\n`);
+    }
 
-      try {
-        const event = JSON.parse(data);
-        const msgType = event.message_type;
-
-        if (msgType === 'assistant_message') {
-          // Extract text content
-          let text = '';
-          if (typeof event.content === 'string') {
-            text = event.content;
-          } else if (Array.isArray(event.content)) {
-            text = event.content.filter(c => c.type === 'text').map(c => c.text).join('');
-          }
-          if (text) {
-            // Token streaming returns incremental pieces, so append each chunk.
-            clientRes.write(`data: ${JSON.stringify({ type: 'delta', text })}\n\n`);
-            fullText += text;
-          }
-        }
-
-        if (msgType === 'tool_call_message') {
-          const toolName = event.tool_call?.name || event.tool_calls?.[0]?.name || 'unknown';
-          clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: `letta:${toolName}`, status: 'calling' })}\n\n`);
-        }
-
-        if (msgType === 'tool_return_message') {
-          const toolName = event.tool_returns?.[0]?.tool_call_id || 'tool';
-          clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: `letta:${toolName}`, status: 'done' })}\n\n`);
-        }
-
-        if (msgType === 'reasoning_message') {
-          // Could show thinking indicator — skip for now, Letta handles internally
-        }
-
-      } catch (e) { /* skip unparseable */ }
+    if (msgType === 'tool_return_message') {
+      const toolName = event.tool_returns?.[0]?.tool_call_id || 'tool';
+      clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: `letta:${toolName}`, status: 'done' })}\n\n`);
     }
   }
 
@@ -958,8 +926,8 @@ app.post('/api/message', async (req, res) => {
         res.write(`data: ${JSON.stringify({ type: 'done', timestamp: responseTimestamp })}\n\n`);
       } catch (lettaErr) {
         console.error('[Letta Error]', lettaErr.message);
-        // Auto-fallback to Claude if Letta fails and we have a key
-        if (ANTHROPIC_KEY) {
+        // Only change providers when the owner has explicitly enabled fallback.
+        if (ANTHROPIC_KEY && LETTA_FALLBACK_TO_CLAUDE) {
           console.log('  ↻ Letta failed, falling back to Claude...');
           res.write(`data: ${JSON.stringify({ type: 'tool', name: 'system', status: 'calling', error: 'Letta unavailable — falling back to Claude' })}\n\n`);
           // Fall through to Claude path below
