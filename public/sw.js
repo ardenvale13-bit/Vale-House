@@ -1,4 +1,4 @@
-const CACHE_NAME = 'vale-house-v10';
+const CACHE_NAME = 'vale-house-v11';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
@@ -55,9 +55,10 @@ self.addEventListener('fetch', event => {
   }
 });
 
-// Handle push notifications (for future use)
+// Handle push notifications from the hosted Vale House server
 self.addEventListener('push', event => {
-  const data = event.data ? event.data.json() : {};
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch (error) { data = { body: event.data?.text() }; }
   const title = data.title || 'Vale House';
   const options = {
     body: data.body || 'Lincoln sent you a message',

@@ -34,11 +34,22 @@ GAMES_MCP_URL=
 Attach one persistent volume at `/data`. This stores:
 
 - `/data/chats` — Vale House chat history and reactions
-- `/data/uploads` — images uploaded through the chat
+- `/data/uploads` — images and voice notes uploaded through the chat
+- `/data/scheduled-messages.json` — pending and completed scheduled messages
+- `/data/push-subscriptions.json` — devices that opted into notifications
+- `/data/push-vapid.json` — generated push-notification signing keys
 
 Run exactly one application instance. The current chat, selected model,
 presence, and mood are held in process memory, while chat files and uploads are
 persisted on disk.
+
+The `/data` volume is required for scheduled messages and push subscriptions to
+survive a Railway redeploy. Push keys are generated automatically on first boot,
+or can be supplied with `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, and
+`VAPID_SUBJECT`.
+
+On iPhone/iPad, install Vale House to the Home Screen before enabling push
+notifications. Desktop and Android browsers can enable them directly in Settings.
 
 ## Domain
 

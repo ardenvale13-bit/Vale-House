@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const { EventEmitter } = require('events');
 const { Letta } = require('@letta-ai/letta-client');
+const webpush = require('web-push');
 
 const app = express();
 const PORT = process.env.PORT || 3333;
@@ -50,6 +51,7 @@ const LETTA_API_KEY = env.LETTA_API_KEY || process.env.LETTA_API_KEY || '';
 const LETTA_CONVERSATION_ID = env.LETTA_CONVERSATION_ID || process.env.LETTA_CONVERSATION_ID;
 const LETTA_FALLBACK_TO_CLAUDE = (env.LETTA_FALLBACK_TO_CLAUDE || process.env.LETTA_FALLBACK_TO_CLAUDE || '').toLowerCase() === 'true';
 const VALE_DATA_DIR = env.VALE_DATA_DIR || process.env.VALE_DATA_DIR || '';
+const VAPID_SUBJECT = env.VAPID_SUBJECT || process.env.VAPID_SUBJECT || 'mailto:vale-house@valeverse.party';
 const lettaClient = new Letta({
   baseURL: LETTA_URL.replace(/\/$/, ''),
   apiKey: LETTA_API_KEY || null
@@ -500,6 +502,50 @@ if (!fs.existsSync(CHATS_DIR)) fs.mkdirSync(CHATS_DIR, { recursive: true });
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 if (VALE_DATA_DIR) app.use('/uploads', express.static(UPLOADS_DIR));
 
+const STATE_DIR = VALE_DATA_DIR || path.join(__dirname, 'chats');
+const PUSH_FILE = path.join(STATE_DIR, 'push-subscriptions.json');
+const SCHEDULE_FILE = path.join(STATE_DIR, 'scheduled-messages.json');
+const VAPID_FILE = path.join(STATE_DIR, 'push-vapid.json');
+
+function readJsonFile(file, fallback) {
+  try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : fallback; }
+  catch (error) { console.error(`  ⚠ Could not read ${path.basename(file)}:`, error.message); return fallback; }
+}
+
+function writeJsonFile(file, value) {
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(value, null, 2), 'utf8');
+  fs.renameSync(temp, file);
+}
+
+let pushSubscriptions = readJsonFile(PUSH_FILE, []);
+let scheduledMessages = readJsonFile(SCHEDULE_FILE, []);
+let vapidKeys = {
+  publicKey: env.VAPID_PUBLIC_KEY || process.env.VAPID_PUBLIC_KEY,
+  privateKey: env.VAPID_PRIVATE_KEY || process.env.VAPID_PRIVATE_KEY
+};
+if (!vapidKeys.publicKey || !vapidKeys.privateKey) {
+  vapidKeys = readJsonFile(VAPID_FILE, null) || webpush.generateVAPIDKeys();
+  writeJsonFile(VAPID_FILE, vapidKeys);
+}
+webpush.setVapidDetails(VAPID_SUBJECT, vapidKeys.publicKey, vapidKeys.privateKey);
+
+async function sendPushNotification(title, body, url = '/') {
+  const payload = JSON.stringify({ title, body: String(body || '').slice(0, 220), url });
+  const expired = new Set();
+  await Promise.all(pushSubscriptions.map(async subscription => {
+    try { await webpush.sendNotification(subscription, payload); }
+    catch (error) {
+      if (error.statusCode === 404 || error.statusCode === 410) expired.add(subscription.endpoint);
+      else console.error('  🔔 Push failed:', error.message);
+    }
+  }));
+  if (expired.size) {
+    pushSubscriptions = pushSubscriptions.filter(s => !expired.has(s.endpoint));
+    writeJsonFile(PUSH_FILE, pushSubscriptions);
+  }
+}
+
 let currentChatId = null;
 let conversationHistory = [];
 const MAX_HISTORY = 50;
@@ -788,6 +834,13 @@ async function handleClaudeMessage(history, message, image, clientRes, onComplet
 // LETTA PROVIDER
 // =============================================
 let lettaAvailable = false;
+let lettaQueue = Promise.resolve();
+
+function queueLettaRequest(task) {
+  const run = lettaQueue.then(task, task);
+  lettaQueue = run.catch(() => {});
+  return run;
+}
 
 function lettaHeaders() {
   const headers = {
@@ -817,7 +870,7 @@ if (LETTA_AGENT_ID) {
   setInterval(checkLettaHealth, 30000);
 }
 
-async function handleLettaMessage(message, imageBase64, clientRes) {
+async function handleLettaMessage(message, imageBase64, clientRes = null) {
   let input = message || '';
 
   // Use the current create-message route. Letta keeps the agent's history server-side.
@@ -876,19 +929,19 @@ async function handleLettaMessage(message, imageBase64, clientRes) {
         text = event.content.filter(c => c.type === 'text').map(c => c.text).join('');
       }
       if (text) {
-        clientRes.write(`data: ${JSON.stringify({ type: 'delta', text })}\n\n`);
+        if (clientRes) clientRes.write(`data: ${JSON.stringify({ type: 'delta', text })}\n\n`);
         fullText += text;
       }
     }
 
     if (msgType === 'tool_call_message') {
       const toolName = event.tool_call?.name || event.tool_calls?.[0]?.name || 'unknown';
-      clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: `letta:${toolName}`, status: 'calling' })}\n\n`);
+      if (clientRes) clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: `letta:${toolName}`, status: 'calling' })}\n\n`);
     }
 
     if (msgType === 'tool_return_message') {
       const toolName = event.tool_returns?.[0]?.tool_call_id || 'tool';
-      clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: `letta:${toolName}`, status: 'done' })}\n\n`);
+      if (clientRes) clientRes.write(`data: ${JSON.stringify({ type: 'tool', name: `letta:${toolName}`, status: 'done' })}\n\n`);
     }
   }
 
@@ -896,9 +949,10 @@ async function handleLettaMessage(message, imageBase64, clientRes) {
 }
 
 app.post('/api/message', async (req, res) => {
-  const { message, image } = req.body;
+  const { message, image, audioUrl } = req.body;
   console.log(`  📩 Message received — text: ${(message||'').substring(0,50)}, image: ${image ? `yes (${image.length} chars)` : 'no'}`);
   if ((!message || !message.trim()) && !image) return res.status(400).json({ error: 'Empty message' });
+  if (audioUrl && !/^\/uploads\/voice-[a-zA-Z0-9.-]+$/.test(audioUrl)) return res.status(400).json({ error: 'Invalid voice note URL' });
   const isLetta = currentModel === 'letta';
   if (!isLetta && !ANTHROPIC_KEY) return res.status(500).json({ error: 'No API key configured' });
   if (isLetta && !LETTA_AGENT_ID) return res.status(500).json({ error: 'No Letta agent configured' });
@@ -913,7 +967,7 @@ app.post('/api/message', async (req, res) => {
   try {
     const timestamp = new Date().toISOString();
     // Store the text content for history (images are too large to persist in full)
-    conversationHistory.push({ role: 'user', content: message || '*sent an image*', timestamp, reactions: [], seen: true, hasImage: !!image });
+    conversationHistory.push({ role: 'user', content: message || (audioUrl ? '*sent a voice note*' : '*sent an image*'), timestamp, reactions: [], seen: true, hasImage: !!image, audioUrl: audioUrl || null });
     if (conversationHistory.length > MAX_HISTORY) conversationHistory = conversationHistory.slice(-MAX_HISTORY);
 
     let fullResponse = '';
@@ -921,7 +975,7 @@ app.post('/api/message', async (req, res) => {
     if (isLetta) {
       // ── LETTA PROVIDER ──
       try {
-        fullResponse = await handleLettaMessage(message, image, res);
+        fullResponse = await queueLettaRequest(() => handleLettaMessage(message, image, res));
         const responseTimestamp = new Date().toISOString();
         res.write(`data: ${JSON.stringify({ type: 'done', timestamp: responseTimestamp })}\n\n`);
       } catch (lettaErr) {
@@ -972,6 +1026,9 @@ app.post('/api/message', async (req, res) => {
     conversationHistory.push({ role: 'assistant', content: fullResponse, timestamp: finalTimestamp, reactions: [], seen: false });
     saveChatToFile(currentChatId, conversationHistory);
     orientedThisChat = true;
+    if (fullResponse && ardenPresence.status !== 'online') {
+      sendPushNotification('Lincoln', fullResponse, '/').catch(error => console.error('  🔔 Push failed:', error.message));
+    }
 
   } catch (error) {
     console.error('[Error]', error.message);
@@ -1060,6 +1117,110 @@ app.post('/api/upload', (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+app.post('/api/upload/audio', (req, res) => {
+  const { audio } = req.body;
+  const match = typeof audio === 'string' && audio.match(/^data:audio\/(webm|ogg|mp4|mpeg|wav|x-m4a);base64,([A-Za-z0-9+/=]+)$/i);
+  if (!match) return res.status(400).json({ error: 'Unsupported audio data' });
+  try {
+    const buffer = Buffer.from(match[2], 'base64');
+    if (!buffer.length || buffer.length > 12 * 1024 * 1024) return res.status(413).json({ error: 'Voice note must be under 12 MB' });
+    const extMap = { webm: 'webm', ogg: 'ogg', mp4: 'm4a', mpeg: 'mp3', wav: 'wav', 'x-m4a': 'm4a' };
+    const fname = `voice-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${extMap[match[1].toLowerCase()]}`;
+    fs.writeFileSync(path.join(UPLOADS_DIR, fname), buffer);
+    res.json({ url: `/uploads/${fname}`, filename: fname });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =============================================
+// PUSH NOTIFICATIONS
+// =============================================
+app.get('/api/push/public-key', (req, res) => res.json({ publicKey: vapidKeys.publicKey }));
+
+app.post('/api/push/subscribe', (req, res) => {
+  const subscription = req.body;
+  if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
+    return res.status(400).json({ error: 'Invalid push subscription' });
+  }
+  pushSubscriptions = pushSubscriptions.filter(s => s.endpoint !== subscription.endpoint);
+  pushSubscriptions.push(subscription);
+  writeJsonFile(PUSH_FILE, pushSubscriptions);
+  res.status(201).json({ subscribed: true });
+});
+
+app.delete('/api/push/subscribe', (req, res) => {
+  const endpoint = req.body?.endpoint;
+  pushSubscriptions = endpoint ? pushSubscriptions.filter(s => s.endpoint !== endpoint) : pushSubscriptions;
+  writeJsonFile(PUSH_FILE, pushSubscriptions);
+  res.json({ subscribed: false });
+});
+
+// =============================================
+// SCHEDULED MESSAGES
+// =============================================
+function saveSchedules() { writeJsonFile(SCHEDULE_FILE, scheduledMessages); }
+
+app.get('/api/schedules', (req, res) => {
+  res.json({ schedules: scheduledMessages.slice().sort((a, b) => new Date(a.runAt) - new Date(b.runAt)) });
+});
+
+app.post('/api/schedules', (req, res) => {
+  const prompt = String(req.body?.prompt || '').trim();
+  const runAt = new Date(req.body?.runAt);
+  if (!prompt || prompt.length > 4000) return res.status(400).json({ error: 'Add a message under 4,000 characters' });
+  if (!Number.isFinite(runAt.getTime()) || runAt.getTime() < Date.now() + 15000) return res.status(400).json({ error: 'Choose a time at least 15 seconds from now' });
+  const schedule = { id: crypto.randomUUID(), prompt, runAt: runAt.toISOString(), status: 'pending', createdAt: new Date().toISOString() };
+  scheduledMessages.push(schedule);
+  saveSchedules();
+  res.status(201).json(schedule);
+});
+
+app.delete('/api/schedules/:id', (req, res) => {
+  const before = scheduledMessages.length;
+  scheduledMessages = scheduledMessages.filter(s => !(s.id === req.params.id && s.status === 'pending'));
+  saveSchedules();
+  res.status(before === scheduledMessages.length ? 404 : 200).json({ deleted: before !== scheduledMessages.length });
+});
+
+let processingSchedules = false;
+async function processDueSchedules() {
+  if (processingSchedules || !LETTA_AGENT_ID) return;
+  const due = scheduledMessages.filter(s => s.status === 'pending' && new Date(s.runAt).getTime() <= Date.now());
+  if (!due.length) return;
+  processingSchedules = true;
+  try {
+    for (const schedule of due) {
+      schedule.status = 'running';
+      schedule.startedAt = new Date().toISOString();
+      saveSchedules();
+      try {
+        const request = `[SCHEDULED MESSAGE FROM ARDEN]\nArden asked you earlier to respond at this time. Their request was: ${schedule.prompt}\nRespond directly and naturally to Arden now.`;
+        const response = await queueLettaRequest(() => handleLettaMessage(request, null));
+        if (!response.trim()) throw new Error('Lincoln returned an empty response');
+        const timestamp = new Date().toISOString();
+        conversationHistory.push({ role: 'assistant', content: response, timestamp, reactions: [], seen: false, scheduled: true, scheduleId: schedule.id });
+        if (conversationHistory.length > MAX_HISTORY) conversationHistory = conversationHistory.slice(-MAX_HISTORY);
+        saveChatToFile(currentChatId, conversationHistory);
+        schedule.status = 'sent';
+        schedule.sentAt = timestamp;
+        schedule.chatId = currentChatId;
+        await sendPushNotification('Lincoln', response, '/');
+      } catch (error) {
+        schedule.status = 'failed';
+        schedule.error = error.message;
+        schedule.failedAt = new Date().toISOString();
+        console.error('  ⏰ Scheduled message failed:', error.message);
+        await sendPushNotification('Vale House', `A scheduled message failed: ${schedule.prompt}`, '/');
+      }
+      saveSchedules();
+    }
+  } finally { processingSchedules = false; }
+}
+
+setInterval(processDueSchedules, 10000);
+setTimeout(processDueSchedules, 1500);
 
 // =============================================
 // CHATS

@@ -15,6 +15,7 @@
   "dependencies": {
     "@letta-ai/letta-client": "^1.12.1",
     "cors": "^2.8.6",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "web-push": "^3.6.7"
   }
 }

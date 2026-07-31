@@ -439,6 +439,26 @@ input[type="file"] { display:none; }
   cursor:pointer; display:flex; align-items:center; justify-content:center;
 }
 
+.voice-preview {
+  display:none; position:absolute; bottom:62px; left:12px; right:12px;
+  background:var(--bg-elevated); border:1px solid var(--accent-dim); border-radius:12px;
+  padding:10px 12px; align-items:center; gap:10px; box-shadow:0 -8px 32px rgba(0,0,0,.4); z-index:100;
+}
+.voice-preview.show { display:flex; }
+.voice-preview-text { flex:1; min-width:0; font-size:.75rem; color:var(--text-2); }
+.voice-preview-text strong { display:block; color:var(--accent); font-family:var(--font-mono); font-size:.65rem; margin-bottom:2px; }
+.voice-cancel { border:none; background:transparent; color:var(--text-3); font-size:20px; cursor:pointer; }
+.ib.recording { color:#e35d6a; border-color:#e35d6a; animation:pulse 1s ease-in-out infinite; }
+.schedule-form { display:grid; gap:8px; }
+.schedule-form textarea,.schedule-form input { width:100%; resize:vertical; }
+.schedule-action { border:1px solid var(--accent-dim); background:var(--bg-elevated); color:var(--accent); border-radius:8px; padding:8px; cursor:pointer; font-family:var(--font-body); }
+.schedule-list { display:grid; gap:8px; margin-top:10px; }
+.schedule-item { border:1px solid var(--border); background:var(--bg-surface); border-radius:9px; padding:9px; }
+.schedule-item-head { display:flex; justify-content:space-between; gap:8px; color:var(--accent-dim); font-family:var(--font-mono); font-size:.6rem; }
+.schedule-item-body { color:var(--text-2); font-size:.78rem; margin-top:5px; overflow-wrap:anywhere; }
+.schedule-cancel { border:none; background:transparent; color:var(--error); cursor:pointer; }
+.settings-note { font-size:.7rem; color:var(--text-3); margin-top:5px; font-style:italic; }
+
 /* Connection */
 .conn-bar {
   display:none; padding:6px 16px; text-align:center; font-size:.7rem;
@@ -644,6 +664,7 @@ input[type="file"] { display:none; }
     <button class="ib" id="emoBtn">&#9786;</button>
     <button class="ib gif-btn" id="gifBtn">GIF</button>
     <button class="ib" id="imgBtn">&#128247;</button>
+    <button class="ib" id="micBtn" title="Record voice note">&#127908;</button>
     <input type="file" id="imgIn" accept="image/*">
     <div class="picker emoji-pick" id="emoPick">
       <div class="pick-title">Vale House</div>
@@ -656,6 +677,7 @@ input[type="file"] { display:none; }
       <div class="gif-results" id="gifR"></div>
     </div>
     <div class="img-preview" id="imgPrev"><button class="rm" id="imgRm">&times;</button><img id="imgPrevImg"></div>
+    <div class="voice-preview" id="voicePrev"><div class="voice-preview-text"><strong id="voiceState">VOICE NOTE READY</strong><span id="voiceCaption">Add a caption if transcription missed anything.</span></div><button class="voice-cancel" id="voiceRm">&times;</button></div>
     <textarea class="chat-input" id="chatIn" placeholder="Talk to me, sable..." rows="1"></textarea>
     <button class="send" id="sendBtn">&rarr;</button>
   </div>
@@ -738,6 +760,18 @@ input[type="file"] { display:none; }
       <div class="settings-label">Sounds & Notifications</div>
       <div class="settings-row"><label>Message sounds</label><div class="settings-toggle" id="sSound"></div></div>
       <div class="settings-row"><label>Notifications</label><div class="settings-toggle" id="sNotify"></div></div>
+      <div class="settings-note" id="pushStatus">Turn this on to receive Lincoln's replies when Vale House is closed.</div>
+    </div>
+
+    <div class="settings-group">
+      <div class="settings-label">Scheduled Messages</div>
+      <div class="schedule-form">
+        <textarea class="settings-input" id="schedulePrompt" rows="3" placeholder="What should Lincoln message you about?"></textarea>
+        <input class="settings-input" id="scheduleTime" type="datetime-local">
+        <button class="schedule-action" id="scheduleAdd">Schedule with Lincoln</button>
+      </div>
+      <div class="settings-note">Railway wakes Lincoln at this time, even when your computer is off.</div>
+      <div class="schedule-list" id="scheduleList"></div>
     </div>
 
     <div class="settings-group">
@@ -773,7 +807,8 @@ input[type="file"] { display:none; }
    STATE
    ============================================ */
 const API=window.location.origin;
-let waiting=false, chatId=null, pendImg=null, msgEls=[], gifTimer=null, VTOKEN='';
+let waiting=false, chatId=null, pendImg=null, pendVoice=null, msgEls=[], gifTimer=null, VTOKEN='';
+let mediaRecorder=null, mediaStream=null, voiceChunks=[], voiceStartedAt=0, speechRecognition=null, voiceTranscript='';
 let lincolnStatus = 'present'; // Lincoln's self-set status text
 let currentMood=null, seenObserver=null;
 let activeModel = 'claude-sonnet-4-20250514';
@@ -861,6 +896,8 @@ async function boot() {
   initMoodBar();
   loadModel();
   initPWA();
+  refreshPushState();
+  setDefaultScheduleTime();
   // Update clock every second
   updateClock();
   setInterval(updateClock, 1000);
@@ -964,6 +1001,59 @@ function initPWA() {
     deferredInstallPrompt = e;
     showInstallBanner();
   });
+}
+
+function urlBase64ToUint8Array(value) {
+  const padded = value + '='.repeat((4 - value.length % 4) % 4);
+  const raw = atob(padded.replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from([...raw].map(char => char.charCodeAt(0)));
+}
+
+async function setPushEnabled(enabled) {
+  const status = $('pushStatus');
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+    $('sNotify').classList.remove('on');
+    status.textContent = 'Push notifications are not supported by this browser.';
+    return false;
+  }
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    let subscription = await registration.pushManager.getSubscription();
+    if (enabled) {
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') throw new Error('Notification permission was not granted');
+      if (!subscription) {
+        const keyRes = await vfetch(`${API}/api/push/public-key`);
+        const { publicKey } = await keyRes.json();
+        subscription = await registration.pushManager.subscribe({ userVisibleOnly:true, applicationServerKey:urlBase64ToUint8Array(publicKey) });
+      }
+      const res = await vfetch(`${API}/api/push/subscribe`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(subscription) });
+      if (!res.ok) throw new Error('Vale House could not save this device');
+      $('sNotify').classList.add('on');
+      status.textContent = 'Push notifications are on for this device.';
+      return true;
+    }
+    if (subscription) {
+      await vfetch(`${API}/api/push/subscribe`, { method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({endpoint:subscription.endpoint}) });
+      await subscription.unsubscribe();
+    }
+    $('sNotify').classList.remove('on');
+    status.textContent = 'Push notifications are off.';
+    return true;
+  } catch(error) {
+    $('sNotify').classList.remove('on');
+    status.textContent = error.message;
+    return false;
+  }
+}
+
+async function refreshPushState() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+  try {
+    const subscription = await (await navigator.serviceWorker.ready).pushManager.getSubscription();
+    $('sNotify').classList.toggle('on', !!subscription && Notification.permission === 'granted');
+    $('pushStatus').textContent = subscription ? 'Push notifications are on for this device.' : 'Turn this on to receive Lincoln\'s replies when Vale House is closed.';
+  } catch(e) {}
 }
 
 function showInstallBanner() {
@@ -1071,7 +1161,7 @@ async function openChat(id) {
             addMsg('lincoln', safe.outerHTML, null, [], null, true);
           });
         } else {
-          addMsg(role, m.content, m.timestamp, m.reactions||[], null, false, m.seen);
+          addMsg(role, m.content, m.timestamp, m.reactions||[], null, false, m.seen, m.audioUrl);
         }
       });
     }
@@ -1112,7 +1202,7 @@ async function checkHealth() {
   } catch(e) { setConn(false); return false; }
 }
 
-async function sendMsg(text, imageBase64) {
+async function sendMsg(text, imageBase64, audioUrl=null) {
   if(waiting) return;
   waiting=true; $('sendBtn').disabled=true; $('chatIn').disabled=true;
   $('chatStatus').innerHTML='<span style="color:var(--accent-dim);font-style:italic">thinking...</span>';
@@ -1132,6 +1222,7 @@ async function sendMsg(text, imageBase64) {
   try {
     const body = { message: text };
     if (imageBase64) body.image = imageBase64;
+    if (audioUrl) body.audioUrl = audioUrl;
     const res = await vfetch(`${API}/api/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1207,10 +1298,11 @@ async function sendMsg(text, imageBase64) {
 
 function buildVoicePlayer(url) {
   const id = 'vp-' + Math.random().toString(36).slice(2,8);
+  const safeUrl = esc(String(url || ''));
   return `<div class="voice-memo" id="${id}">
     <div class="voice-label">voice memo</div>
     <div style="display:flex;align-items:center;gap:10px;width:100%">
-      <button class="voice-play" data-audio="${url}" data-state="paused" onclick="toggleVoice(this)">
+      <button class="voice-play" data-audio="${safeUrl}" data-state="paused" onclick="toggleVoice(this)">
         <svg viewBox="0 0 24 24"><polygon points="6,3 20,12 6,21"/></svg>
       </button>
       <div class="voice-track">
@@ -1218,7 +1310,7 @@ function buildVoicePlayer(url) {
         <div class="voice-time"><span class="voice-cur">0:00</span><span class="voice-dur">--:--</span></div>
       </div>
     </div>
-    <audio src="${url}" preload="metadata"></audio>
+    <audio src="${safeUrl}" preload="metadata"></audio>
   </div>`;
 }
 
@@ -1364,7 +1456,7 @@ function processStreamedResponse(text, idx, bubble) {
 /* ============================================
    MESSAGE RENDERING
    ============================================ */
-function addMsg(role, text, ts, reactions=[], imgUrl=null, raw=false, seen=null) {
+function addMsg(role, text, ts, reactions=[], imgUrl=null, raw=false, seen=null, audioUrl=null) {
   const idx=msgEls.length;
   const div=document.createElement('div');
   div.className=`msg ${role}`;
@@ -1375,14 +1467,15 @@ function addMsg(role, text, ts, reactions=[], imgUrl=null, raw=false, seen=null)
   const isImgOnly = raw && text.trim().startsWith('<img');
   const bubbleCls = `msg-bubble${isImgOnly?' img-only':''}`;
   const img=imgUrl?`<img class="chat-img" src="${imgUrl}">`:'';
+  const audio=audioUrl?buildVoicePlayer(audioUrl):'';
   const rx=buildReacts(reactions,idx);
   // Seen indicator for Lincoln's messages
   const seenHtml = role==='lincoln' ? `<span class="msg-seen${seen?' read':''}" id="seen-${idx}">${seen?'seen':''}</span>` : '';
 
   if(role==='lincoln') {
-    div.innerHTML=`<div class="msg-avi">${PFP}</div><div class="msg-body"><div class="${bubbleCls}" data-i="${idx}">${html}${img}<div class="react-bar" id="rb-${idx}">${REMOJI.map(e=>`<span data-e="${e}" data-i="${idx}">${e}</span>`).join('')}</div></div><div class="msg-reacts" id="rx-${idx}">${rx}</div><div class="msg-ts">${time}${seenHtml}</div></div>`;
+    div.innerHTML=`<div class="msg-avi">${PFP}</div><div class="msg-body"><div class="${bubbleCls}" data-i="${idx}">${html}${img}${audio}<div class="react-bar" id="rb-${idx}">${REMOJI.map(e=>`<span data-e="${e}" data-i="${idx}">${e}</span>`).join('')}</div></div><div class="msg-reacts" id="rx-${idx}">${rx}</div><div class="msg-ts">${time}${seenHtml}</div></div>`;
   } else {
-    div.innerHTML=`<div class="msg-body"><div class="${bubbleCls}" data-i="${idx}">${html}${img}<div class="react-bar" id="rb-${idx}">${REMOJI.map(e=>`<span data-e="${e}" data-i="${idx}">${e}</span>`).join('')}</div></div><div class="msg-reacts" id="rx-${idx}">${rx}</div><div class="msg-ts">${time}</div></div>`;
+    div.innerHTML=`<div class="msg-body"><div class="${bubbleCls}" data-i="${idx}">${html}${img}${audio}<div class="react-bar" id="rb-${idx}">${REMOJI.map(e=>`<span data-e="${e}" data-i="${idx}">${e}</span>`).join('')}</div></div><div class="msg-reacts" id="rx-${idx}">${rx}</div><div class="msg-ts">${time}</div></div>`;
   }
   msgEls.push(div);
   $('msgs').appendChild(div);
@@ -1533,6 +1626,100 @@ async function searchGif(q) {
       });
     });
   } catch(e){}
+}
+
+/* ============================================
+   VOICE NOTES
+   ============================================ */
+function preferredAudioType() {
+  return ['audio/webm;codecs=opus','audio/mp4','audio/webm','audio/ogg'].find(type => MediaRecorder.isTypeSupported(type)) || '';
+}
+
+async function toggleRecording() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') return stopRecording();
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) return alert('Voice recording is not supported in this browser.');
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({audio:true});
+    voiceChunks=[]; voiceTranscript=''; voiceStartedAt=Date.now();
+    const mimeType=preferredAudioType();
+    mediaRecorder=new MediaRecorder(mediaStream, mimeType ? {mimeType} : undefined);
+    mediaRecorder.ondataavailable=e=>{ if(e.data.size) voiceChunks.push(e.data); };
+    mediaRecorder.onstop=finishRecording;
+    mediaRecorder.start(250);
+    $('micBtn').classList.add('recording');
+    $('voiceState').textContent='RECORDING… TAP MIC TO STOP';
+    $('voiceCaption').textContent='I’ll use speech recognition to help Lincoln understand it.';
+    $('voicePrev').classList.add('show');
+
+    const Recognition=window.SpeechRecognition||window.webkitSpeechRecognition;
+    if(Recognition) {
+      speechRecognition=new Recognition();
+      speechRecognition.continuous=true; speechRecognition.interimResults=true; speechRecognition.lang='en-NZ';
+      speechRecognition.onresult=e=>{
+        let text=''; for(let i=0;i<e.results.length;i++) text+=e.results[i][0].transcript+' ';
+        voiceTranscript=text.trim(); $('voiceCaption').textContent=voiceTranscript||'Listening…';
+      };
+      try { speechRecognition.start(); } catch(e) {}
+    }
+  } catch(error) { alert(`Microphone: ${error.message}`); }
+}
+
+function stopRecording() {
+  if(mediaRecorder?.state==='recording') mediaRecorder.stop();
+  try { speechRecognition?.stop(); } catch(e) {}
+  mediaStream?.getTracks().forEach(track=>track.stop());
+  $('micBtn').classList.remove('recording');
+}
+
+function finishRecording() {
+  const type=mediaRecorder.mimeType||voiceChunks[0]?.type||'audio/webm';
+  const blob=new Blob(voiceChunks,{type});
+  if(!blob.size) return clearVoice();
+  const reader=new FileReader();
+  reader.onload=()=>{
+    pendVoice={dataUrl:reader.result, transcript:voiceTranscript, duration:Math.max(1,Math.round((Date.now()-voiceStartedAt)/1000))};
+    $('voiceState').textContent=`VOICE NOTE READY · ${pendVoice.duration}s`;
+    $('voiceCaption').textContent=voiceTranscript||'Add a caption in the message box so Lincoln knows what you said.';
+    $('voicePrev').classList.add('show');
+  };
+  reader.readAsDataURL(blob);
+}
+
+function clearVoice() {
+  if(mediaRecorder?.state==='recording') mediaRecorder.stop();
+  try { speechRecognition?.stop(); } catch(e) {}
+  mediaStream?.getTracks().forEach(track=>track.stop());
+  mediaRecorder=null; mediaStream=null; pendVoice=null; voiceChunks=[]; voiceTranscript='';
+  $('micBtn').classList.remove('recording'); $('voicePrev').classList.remove('show');
+}
+
+/* ============================================
+   SCHEDULED MESSAGES
+   ============================================ */
+function setDefaultScheduleTime() {
+  const date=new Date(Date.now()+60*60*1000); date.setMinutes(Math.ceil(date.getMinutes()/5)*5,0,0);
+  const local=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);
+  $('scheduleTime').value=local;
+}
+
+async function loadSchedules() {
+  try {
+    const res=await vfetch(`${API}/api/schedules`); if(!res.ok)return;
+    const {schedules}=await res.json();
+    const active=(schedules||[]).filter(s=>['pending','running','failed'].includes(s.status)).slice(-12);
+    $('scheduleList').innerHTML=active.length?active.map(s=>`<div class="schedule-item"><div class="schedule-item-head"><span>${esc(new Date(s.runAt).toLocaleString('en-NZ'))} · ${esc(s.status)}</span>${s.status==='pending'?`<button class="schedule-cancel" data-schedule-id="${s.id}">&times;</button>`:''}</div><div class="schedule-item-body">${esc(s.prompt)}${s.error?`<br><span style="color:var(--error)">${esc(s.error)}</span>`:''}</div></div>`).join(''):'<div class="settings-note">Nothing scheduled yet.</div>';
+    document.querySelectorAll('.schedule-cancel').forEach(button=>button.addEventListener('click',async()=>{ await vfetch(`${API}/api/schedules/${button.dataset.scheduleId}`,{method:'DELETE'}); loadSchedules(); }));
+  } catch(e) {}
+}
+
+async function addSchedule() {
+  const prompt=$('schedulePrompt').value.trim(), value=$('scheduleTime').value;
+  if(!prompt||!value)return alert('Add both a message and a time.');
+  try {
+    const res=await vfetch(`${API}/api/schedules`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,runAt:new Date(value).toISOString()})});
+    const data=await res.json(); if(!res.ok)throw new Error(data.error||'Could not schedule message');
+    $('schedulePrompt').value=''; setDefaultScheduleTime(); await loadSchedules();
+  } catch(error) { alert(error.message); }
 }
 
 /* ============================================
@@ -1694,7 +1881,7 @@ async function loadModel() {
    ============================================ */
 // Home
 $('homeNewBtn').addEventListener('click',newChat);
-$('settingsBtn').addEventListener('click',()=>showScreen('settings'));
+$('settingsBtn').addEventListener('click',()=>{ showScreen('settings'); refreshPushState(); loadSchedules(); });
 
 // Chat
 $('chatBack').addEventListener('click',()=>{ showScreen('home'); refreshHome(); });
@@ -1720,6 +1907,8 @@ $('imgIn').addEventListener('change',e=>{
   r.readAsDataURL(f); $('imgIn').value='';
 });
 $('imgRm').addEventListener('click',()=>{ pendImg=null; $('imgPrev').classList.remove('show'); });
+$('micBtn').addEventListener('click',toggleRecording);
+$('voiceRm').addEventListener('click',clearVoice);
 
 // Close pickers on outside click
 document.addEventListener('click',e=>{
@@ -1736,6 +1925,7 @@ document.addEventListener('click',e=>{
 $('settingsBack').addEventListener('click',()=>showScreen('home'));
 $('sSave').addEventListener('click',()=>{ saveSettings(); showScreen('home'); });
 $('sReset').addEventListener('click',resetSettings);
+$('scheduleAdd').addEventListener('click',addSchedule);
 
 // Font dropdown live preview
 $('sFont').addEventListener('change',()=>{
@@ -1766,12 +1956,7 @@ document.querySelectorAll('.wallpaper-opt').forEach(w=>{
 
 // Toggle switches
 $('sSound').addEventListener('click',()=>$('sSound').classList.toggle('on'));
-$('sNotify').addEventListener('click',()=>{
-  $('sNotify').classList.toggle('on');
-  if($('sNotify').classList.contains('on') && 'Notification' in window && Notification.permission==='default') {
-    Notification.requestPermission();
-  }
-});
+$('sNotify').addEventListener('click',async()=>{ await setPushEnabled(!$('sNotify').classList.contains('on')); });
 
 // Compress image to fit under Anthropic's 5MB limit
 function compressImage(dataUrl, maxBytes=4500000) {
@@ -1814,7 +1999,8 @@ function compressImage(dataUrl, maxBytes=4500000) {
 // Send handler
 async function doSend() {
   const text=$('chatIn').value.trim();
-  if(!text&&!pendImg) return; if(waiting) return;
+  if(!text&&!pendImg&&!pendVoice) return; if(waiting) return;
+  if(pendVoice&&!text&&!pendVoice.transcript) return alert('Add a caption so Lincoln can understand the voice note.');
   let imgUrl=null;
   let imgBase64=null;
   if(pendImg) {
@@ -1822,10 +2008,21 @@ async function doSend() {
     try { const res=await vfetch(`${API}/api/upload`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:pendImg})}); const data=await res.json(); imgUrl=data.url; } catch(e){}
     pendImg=null; $('imgPrev').classList.remove('show');
   }
-  const msg=text||'*sent an image*';
-  addMsg('arden',msg,null,[],imgUrl);
+  let audioUrl=null;
+  let transcript=text;
+  if(pendVoice) {
+    transcript=text||pendVoice.transcript;
+    if(!transcript) return alert('Add a caption so Lincoln can understand the voice note.');
+    try {
+      const res=await vfetch(`${API}/api/upload/audio`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audio:pendVoice.dataUrl})});
+      const data=await res.json(); if(!res.ok)throw new Error(data.error||'Voice upload failed'); audioUrl=data.url;
+    } catch(error) { return alert(error.message); }
+  }
+  const msg=transcript||'*sent an image*';
+  addMsg('arden',msg,null,[],imgUrl,false,null,audioUrl);
   $('chatIn').value=''; $('chatIn').style.height='auto';
-  sendMsg(msg, imgBase64);
+  if(pendVoice) clearVoice();
+  sendMsg(msg, imgBase64, audioUrl);
 }
 
 /* ============================================
