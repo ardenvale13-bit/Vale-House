@@ -1,4 +1,4 @@
-const CACHE_NAME = 'vale-house-v11';
+const CACHE_NAME = 'vale-house-v12';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
@@ -30,6 +30,13 @@ self.addEventListener('fetch', event => {
 
   // Never cache API calls or SSE streams
   if (url.pathname.startsWith('/api/')) return;
+  if (event.request.mode === 'navigate') {
+    event.respondWith(fetch(event.request).then(response => {
+      if (response.ok) { const copy = response.clone(); event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.put('/', copy))); }
+      return response;
+    }).catch(() => caches.match('/')));
+    return;
+  }
 
   // Cache-first for static assets, network-first for pages
   if (STATIC_ASSETS.includes(url.pathname) || url.pathname.startsWith('/emojis/') || url.pathname.startsWith('/profiles/')) {

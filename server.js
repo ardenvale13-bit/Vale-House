@@ -6,6 +6,7 @@ const fs = require('fs');
 const { EventEmitter } = require('events');
 const { Letta } = require('@letta-ai/letta-client');
 const webpush = require('web-push');
+const { applyReactions, resolveGifs } = require('./scripts/message-content');
 
 const app = express();
 const PORT = process.env.PORT || 3333;
@@ -54,7 +55,9 @@ const VALE_DATA_DIR = env.VALE_DATA_DIR || process.env.VALE_DATA_DIR || '';
 const VAPID_SUBJECT = env.VAPID_SUBJECT || process.env.VAPID_SUBJECT || 'mailto:vale-house@valeverse.party';
 const lettaClient = new Letta({
   baseURL: LETTA_URL.replace(/\/$/, ''),
-  apiKey: LETTA_API_KEY || null
+  apiKey: LETTA_API_KEY || null,
+  timeout: 120000,
+  maxRetries: 0
 });
 
 if (!ANTHROPIC_KEY) { console.error('  ⚠ No ANTHROPIC_API_KEY in .env — messaging will fail'); }
@@ -520,6 +523,9 @@ function writeJsonFile(file, value) {
 
 let pushSubscriptions = readJsonFile(PUSH_FILE, []);
 let scheduledMessages = readJsonFile(SCHEDULE_FILE, []);
+for (const schedule of scheduledMessages) {
+  if (schedule.status === 'running') schedule.status = 'pending';
+}
 let vapidKeys = {
   publicKey: env.VAPID_PUBLIC_KEY || process.env.VAPID_PUBLIC_KEY,
   privateKey: env.VAPID_PRIVATE_KEY || process.env.VAPID_PRIVATE_KEY
@@ -533,8 +539,10 @@ webpush.setVapidDetails(VAPID_SUBJECT, vapidKeys.publicKey, vapidKeys.privateKey
 async function sendPushNotification(title, body, url = '/') {
   const payload = JSON.stringify({ title, body: String(body || '').slice(0, 220), url });
   const expired = new Set();
+  const total = pushSubscriptions.length;
+  let delivered = 0;
   await Promise.all(pushSubscriptions.map(async subscription => {
-    try { await webpush.sendNotification(subscription, payload); }
+    try { await webpush.sendNotification(subscription, payload, { timeout:15000 }); delivered++; }
     catch (error) {
       if (error.statusCode === 404 || error.statusCode === 410) expired.add(subscription.endpoint);
       else console.error('  🔔 Push failed:', error.message);
@@ -544,11 +552,11 @@ async function sendPushNotification(title, body, url = '/') {
     pushSubscriptions = pushSubscriptions.filter(s => !expired.has(s.endpoint));
     writeJsonFile(PUSH_FILE, pushSubscriptions);
   }
+  return { total, delivered };
 }
 
 let currentChatId = null;
 let conversationHistory = [];
-const MAX_HISTORY = 50;
 const CONTEXT_WINDOW = 12;
 
 // =============================================
@@ -576,7 +584,7 @@ function saveChatToFile(chatId, history) {
     preview: history.find(m => m.role === 'user')?.content?.substring(0, 80) || 'New conversation',
     messageCount: history.length
   };
-  fs.writeFileSync(chatFile, JSON.stringify({ meta, messages: history }, null, 2), 'utf8');
+  writeJsonFile(chatFile, { meta, messages: history });
 }
 
 function loadChatFromFile(chatId) {
@@ -898,8 +906,9 @@ async function handleLettaMessage(message, imageBase64, clientRes = null) {
   console.log(`  🧠 Letta URL: ${LETTA_URL.replace(/\/$/, '')}`);
 
   let stream;
+  const requestOptions = { signal:AbortSignal.timeout(120000) };
   try {
-    stream = await lettaClient.agents.messages.create(LETTA_AGENT_ID, reqBody);
+    stream = await lettaClient.agents.messages.create(LETTA_AGENT_ID, reqBody, requestOptions);
   } catch (error) {
     if (!imageBase64) throw error;
     console.log('  🧠 Letta: multimodal failed, retrying text-only');
@@ -911,7 +920,8 @@ async function handleLettaMessage(message, imageBase64, clientRes = null) {
         streaming: true,
         stream_tokens: true,
         include_pings: true
-      }
+      },
+      requestOptions
     );
   }
 
@@ -948,14 +958,23 @@ async function handleLettaMessage(message, imageBase64, clientRes = null) {
   return fullText;
 }
 
+let messageInFlight = false;
 app.post('/api/message', async (req, res) => {
-  const { message, image, audioUrl } = req.body;
+  const { message, image, audioUrl, imageUrl, gifUrl } = req.body;
+  if (gifUrl) {
+    try { const url = new URL(gifUrl); if (url.protocol !== 'https:' || url.username || url.password) throw new Error(); }
+    catch (_) { return res.status(400).json({ error:'Invalid GIF URL' }); }
+  }
+  if (imageUrl && !/^\/uploads\/[a-zA-Z0-9_.-]+$/.test(imageUrl)) return res.status(400).json({ error:'Invalid image URL' });
   console.log(`  📩 Message received — text: ${(message||'').substring(0,50)}, image: ${image ? `yes (${image.length} chars)` : 'no'}`);
   if ((!message || !message.trim()) && !image) return res.status(400).json({ error: 'Empty message' });
   if (audioUrl && !/^\/uploads\/voice-[a-zA-Z0-9.-]+$/.test(audioUrl)) return res.status(400).json({ error: 'Invalid voice note URL' });
   const isLetta = currentModel === 'letta';
   if (!isLetta && !ANTHROPIC_KEY) return res.status(500).json({ error: 'No API key configured' });
   if (isLetta && !LETTA_AGENT_ID) return res.status(500).json({ error: 'No Letta agent configured' });
+  if (messageInFlight || processingSchedules) return res.status(409).json({ error:'Lincoln is finishing another message. Please try again shortly.' });
+  if (req.body.chatId && req.body.chatId !== currentChatId) return res.status(409).json({ error:'Conversation changed. Reopen it before sending.' });
+  messageInFlight = true;
 
   // Set up SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
@@ -967,8 +986,8 @@ app.post('/api/message', async (req, res) => {
   try {
     const timestamp = new Date().toISOString();
     // Store the text content for history (images are too large to persist in full)
-    conversationHistory.push({ role: 'user', content: message || (audioUrl ? '*sent a voice note*' : '*sent an image*'), timestamp, reactions: [], seen: true, hasImage: !!image, audioUrl: audioUrl || null });
-    if (conversationHistory.length > MAX_HISTORY) conversationHistory = conversationHistory.slice(-MAX_HISTORY);
+    conversationHistory.push({ role: 'user', content: message || (audioUrl ? '*sent a voice note*' : '*sent an image*'), timestamp, reactions: [], seen: true, hasImage: !!image, imageUrl:imageUrl || null, gifUrl:gifUrl || null, audioUrl: audioUrl || null });
+    saveChatToFile(currentChatId, conversationHistory);
 
     let fullResponse = '';
 
@@ -987,7 +1006,7 @@ app.post('/api/message', async (req, res) => {
           // Fall through to Claude path below
           await handleClaudeMessage(conversationHistory, message, image, res, (text) => { fullResponse = text; });
         } else {
-          res.write(`data: ${JSON.stringify({ type: 'error', error: lettaErr.message })}\n\n`);
+          throw lettaErr;
         }
       }
     } else {
@@ -995,36 +1014,21 @@ app.post('/api/message', async (req, res) => {
       await handleClaudeMessage(conversationHistory, message, image, res, (text) => { fullResponse = text; });
     }
 
-    // Resolve [GIF:query] shorthand into actual Giphy URLs
-    if (fullResponse.includes('[GIF:')) {
-      const gifPattern = /\[GIF:([^\]]+)\]/g;
-      let match;
-      while ((match = gifPattern.exec(fullResponse)) !== null) {
-        const query = match[1].trim();
-        if (GIPHY_KEY) {
-          try {
-            const giphyUrl = `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_KEY}&q=${encodeURIComponent(query)}&limit=1&rating=r`;
-            const gRes = await fetch(giphyUrl);
-            if (gRes.ok) {
-              const gData = await gRes.json();
-              const gif = gData.data?.[0];
-              if (gif) {
-                const gifUrl = gif.images?.original?.url || gif.images?.fixed_height?.url;
-                fullResponse = fullResponse.replace(match[0], `[GIF](${gifUrl})`);
-                console.log(`  [GIF] Resolved "${query}" → ${gifUrl}`);
-              }
-            }
-          } catch (e) {
-            console.log(`  [GIF] Failed to resolve "${query}": ${e.message}`);
-          }
-        }
-      }
-    }
+    fullResponse = await resolveGifs(fullResponse, async query => {
+      if (!GIPHY_KEY) return null;
+      const res = await fetch('https://api.giphy.com/v1/gifs/search?api_key=' + GIPHY_KEY + '&q=' + encodeURIComponent(query) + '&limit=1&rating=r', { signal:AbortSignal.timeout(10000) });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.data?.[0]?.images?.original?.url || data.data?.[0]?.images?.fixed_height?.url;
+    });
 
     // Save the final text response to conversation history
+    applyReactions(fullResponse, conversationHistory);
+    if (!fullResponse.trim()) throw new Error('Lincoln returned an empty response');
     const finalTimestamp = new Date().toISOString();
     conversationHistory.push({ role: 'assistant', content: fullResponse, timestamp: finalTimestamp, reactions: [], seen: false });
     saveChatToFile(currentChatId, conversationHistory);
+    res.write(`data: ${JSON.stringify({ type:'saved', text:fullResponse, timestamp:finalTimestamp, reactions:conversationHistory.map(m => m.reactions || []) })}\n\n`);
     orientedThisChat = true;
     if (fullResponse && ardenPresence.status !== 'online') {
       sendPushNotification('Lincoln', fullResponse, '/').catch(error => console.error('  🔔 Push failed:', error.message));
@@ -1035,6 +1039,7 @@ app.post('/api/message', async (req, res) => {
     res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
   }
 
+  messageInFlight = false;
   res.end();
 });
 
@@ -1042,8 +1047,10 @@ app.post('/api/message', async (req, res) => {
 // REACTIONS
 // =============================================
 app.post('/api/react', (req, res) => {
-  const { messageIndex, emoji, from } = req.body;
-  if (messageIndex >= 0 && messageIndex < conversationHistory.length) {
+  const { messageIndex, emoji, from, chatId } = req.body;
+  if (chatId && chatId !== currentChatId) return res.status(409).json({ error:'Conversation changed. Reopen it before reacting.' });
+  if (!['arden','lincoln'].includes(from) || typeof emoji !== 'string' || !emoji.trim() || emoji.length > 100) return res.status(400).json({ error:'Invalid reaction' });
+  if (Number.isInteger(messageIndex) && messageIndex >= 0 && messageIndex < conversationHistory.length) {
     if (!conversationHistory[messageIndex].reactions) {
       conversationHistory[messageIndex].reactions = [];
     }
@@ -1167,11 +1174,12 @@ app.get('/api/schedules', (req, res) => {
 });
 
 app.post('/api/schedules', (req, res) => {
+  if (!LETTA_AGENT_ID) return res.status(503).json({ error:'Scheduled messages need a configured Letta agent' });
   const prompt = String(req.body?.prompt || '').trim();
   const runAt = new Date(req.body?.runAt);
   if (!prompt || prompt.length > 4000) return res.status(400).json({ error: 'Add a message under 4,000 characters' });
   if (!Number.isFinite(runAt.getTime()) || runAt.getTime() < Date.now() + 15000) return res.status(400).json({ error: 'Choose a time at least 15 seconds from now' });
-  const schedule = { id: crypto.randomUUID(), prompt, runAt: runAt.toISOString(), status: 'pending', createdAt: new Date().toISOString() };
+  const schedule = { id: crypto.randomUUID(), prompt, runAt: runAt.toISOString(), chatId:currentChatId, status: 'pending', createdAt: new Date().toISOString() };
   scheduledMessages.push(schedule);
   saveSchedules();
   res.status(201).json(schedule);
@@ -1183,44 +1191,46 @@ app.delete('/api/schedules/:id', (req, res) => {
   saveSchedules();
   res.status(before === scheduledMessages.length ? 404 : 200).json({ deleted: before !== scheduledMessages.length });
 });
+app.post('/api/schedules/:id/retry', (req, res) => {
+  const schedule = scheduledMessages.find(s => s.id === req.params.id);
+  if (!schedule || !['failed', 'pending'].includes(schedule.status)) return res.status(409).json({ error:'This schedule cannot be retried now' });
+  schedule.status = 'pending';
+  schedule.nextAttemptAt = new Date().toISOString();
+  delete schedule.error;
+  saveSchedules();
+  res.json(schedule);
+});
 
+const { runSchedule, isDue } = require('./scripts/scheduler');
 let processingSchedules = false;
 async function processDueSchedules() {
-  if (processingSchedules || !LETTA_AGENT_ID) return;
-  const due = scheduledMessages.filter(s => s.status === 'pending' && new Date(s.runAt).getTime() <= Date.now());
+  if (processingSchedules || messageInFlight || !LETTA_AGENT_ID) return;
+  const due = scheduledMessages.filter(s => isDue(s));
   if (!due.length) return;
   processingSchedules = true;
   try {
     for (const schedule of due) {
-      schedule.status = 'running';
-      schedule.startedAt = new Date().toISOString();
-      saveSchedules();
-      try {
-        const request = `[SCHEDULED MESSAGE FROM ARDEN]\nArden asked you earlier to respond at this time. Their request was: ${schedule.prompt}\nRespond directly and naturally to Arden now.`;
-        const response = await queueLettaRequest(() => handleLettaMessage(request, null));
-        if (!response.trim()) throw new Error('Lincoln returned an empty response');
-        const timestamp = new Date().toISOString();
-        conversationHistory.push({ role: 'assistant', content: response, timestamp, reactions: [], seen: false, scheduled: true, scheduleId: schedule.id });
-        if (conversationHistory.length > MAX_HISTORY) conversationHistory = conversationHistory.slice(-MAX_HISTORY);
-        saveChatToFile(currentChatId, conversationHistory);
-        schedule.status = 'sent';
-        schedule.sentAt = timestamp;
-        schedule.chatId = currentChatId;
-        await sendPushNotification('Lincoln', response, '/');
-      } catch (error) {
-        schedule.status = 'failed';
-        schedule.error = error.message;
-        schedule.failedAt = new Date().toISOString();
-        console.error('  ⏰ Scheduled message failed:', error.message);
-        await sendPushNotification('Vale House', `A scheduled message failed: ${schedule.prompt}`, '/');
-      }
-      saveSchedules();
+      schedule.chatId ||= currentChatId;
+      await runSchedule(schedule, {
+        generate: prompt => queueLettaRequest(() => handleLettaMessage(`[SCHEDULED MESSAGE FROM ARDEN]\nArden asked you earlier to respond at this time. Their request was: ${prompt}\nRespond directly and naturally to Arden now.`, null)),
+        saveMessage: async job => {
+          const history = job.chatId === currentChatId ? conversationHistory : (loadChatFromFile(job.chatId)?.messages || []);
+          if (!history.some(m => m.scheduleId === job.id)) {
+            applyReactions(job.response, history);
+            history.push({ role:'assistant', content:job.response, timestamp:new Date().toISOString(), reactions:[], seen:false, scheduled:true, scheduleId:job.id });
+          }
+          saveChatToFile(job.chatId, history);
+        },
+        push: response => sendPushNotification('Lincoln', response, '/'),
+        persist: saveSchedules
+      });
     }
   } finally { processingSchedules = false; }
 }
 
-setInterval(processDueSchedules, 10000);
-setTimeout(processDueSchedules, 1500);
+const tickSchedules = () => processDueSchedules().catch(error => console.error('Schedule storage error:', error.message));
+setInterval(tickSchedules, 10000);
+setTimeout(tickSchedules, 1500);
 
 // =============================================
 // CHATS
@@ -1235,6 +1245,7 @@ app.get('/api/chats/:id', (req, res) => {
 });
 
 app.post('/api/chats/switch', (req, res) => {
+  if (messageInFlight || processingSchedules) return res.status(409).json({ error:'Lincoln is finishing a message. Please try again shortly.' });
   const { chatId } = req.body;
   try { saveChatToFile(currentChatId, conversationHistory); } catch(e) {}
 
@@ -1257,6 +1268,7 @@ app.post('/api/chats/switch', (req, res) => {
 });
 
 app.delete('/api/chats/:id', (req, res) => {
+  if (messageInFlight || processingSchedules) return res.status(409).json({ error:'A message is in progress' });
   const chatFile = path.join(CHATS_DIR, `${req.params.id}.json`);
   try {
     if (fs.existsSync(chatFile)) fs.unlinkSync(chatFile);
@@ -1268,6 +1280,7 @@ app.delete('/api/chats/:id', (req, res) => {
 app.get('/api/history', (req, res) => { res.json({ history: conversationHistory }); });
 
 app.delete('/api/history', (req, res) => {
+  if (messageInFlight || processingSchedules) return res.status(409).json({ error:'A message is in progress' });
   saveChatToFile(currentChatId, conversationHistory);
   currentChatId = generateChatId();
   conversationHistory = [];
@@ -1293,15 +1306,15 @@ app.get('/api/emojis', (req, res) => {
 app.get('/api/gifs', async (req, res) => {
   const { q } = req.query;
   if (!q) return res.json({ results: [] });
-  if (!GIPHY_KEY) return res.json({ results: [] });
+  if (!GIPHY_KEY) return res.status(503).json({ error:'GIF search is not configured on the server' });
   try {
     const url = `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_KEY}&q=${encodeURIComponent(q)}&limit=12&rating=r`;
     console.log(`  [GIF] Searching: "${q}"`);
-    const response = await fetch(url);
+    const response = await fetch(url, { signal:AbortSignal.timeout(10000) });
     if (!response.ok) {
       const errText = await response.text();
       console.error(`  [GIF] API error ${response.status}:`, errText);
-      return res.json({ results: [] });
+      return res.status(502).json({ error:'GIF search is temporarily unavailable' });
     }
     const data = await response.json();
     console.log(`  [GIF] Got ${(data.data || []).length} results`);
@@ -1315,7 +1328,7 @@ app.get('/api/gifs', async (req, res) => {
     res.json({ results });
   } catch (e) {
     console.error('  [GIF] Error:', e.message);
-    res.json({ results: [] });
+    res.status(502).json({ error:'GIF search is temporarily unavailable' });
   }
 });
 

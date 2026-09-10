@@ -340,6 +340,10 @@ input[type="file"] { display:none; }
 .react-bar.show { display:flex; }
 .react-bar span { font-size:18px; cursor:pointer; padding:3px; border-radius:50%; transition:transform .15s; }
 .react-bar span:hover { transform:scale(1.3); }
+.reaction-trigger { display:block; margin-top:6px; border:1px solid var(--border); border-radius:12px; padding:4px 9px; background:var(--bg-elevated); color:var(--text-2); font:12px var(--font-body); cursor:pointer; }
+.react-bar { position:relative; bottom:auto; flex-wrap:wrap; white-space:normal; max-width:100%; width:max-content; margin-top:6px; }
+.react-bar button { background:none; border:0; padding:5px; font-size:20px; cursor:pointer; }
+.media-fallback { display:block; font-size:14px; color:var(--accent); }
 
 /* Typing */
 .typing { display:none; align-items:center; padding:8px 0; gap:6px; margin-bottom:8px; }
@@ -414,6 +418,10 @@ input[type="file"] { display:none; }
 .pick-item:hover { background:var(--bg-msg-lincoln); transform:scale(1.2); }
 .pick-item img { width:22px; height:22px; object-fit:contain; }
 .inline-emoji { width:1.3em; height:1.3em; margin:0 1px; display:inline; vertical-align:middle; }
+.msg-bubble.emoji-only { font-size:3rem; line-height:1.25; }
+.msg-bubble.emoji-only .inline-emoji { width:80px; height:80px; object-fit:contain; }
+.msg-bubble.emoji-only .react-bar { font-size:1rem; }
+.chat-input { min-width:0; font-size:16px; }
 
 .gif-search {
   width:100%; padding:6px 12px; background:var(--bg-void); border:1px solid var(--border);
@@ -1051,9 +1059,13 @@ async function refreshPushState() {
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
   try {
     const subscription = await (await navigator.serviceWorker.ready).pushManager.getSubscription();
+    if (subscription && Notification.permission === 'granted') {
+      const res = await vfetch(`${API}/api/push/subscribe`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(subscription) });
+      if (!res.ok) throw new Error('Could not register this device with Vale House');
+    }
     $('sNotify').classList.toggle('on', !!subscription && Notification.permission === 'granted');
     $('pushStatus').textContent = subscription ? 'Push notifications are on for this device.' : 'Turn this on to receive Lincoln\'s replies when Vale House is closed.';
-  } catch(e) {}
+  } catch(e) { $('sNotify').classList.remove('on'); $('pushStatus').textContent=e.message; }
 }
 
 function showInstallBanner() {
@@ -1130,9 +1142,11 @@ async function refreshHome() {
 }
 
 async function openChat(id) {
+  if (waiting) return;
   try {
     const res=await vfetch(`${API}/api/chats/switch`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chatId:id})});
     const data=await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not open conversation');
     chatId=data.chatId;
     msgEls=[];
     $('msgs').innerHTML='<div class="date-sep"><span id="chatDate"></span></div>';
@@ -1157,22 +1171,25 @@ async function openChat(id) {
             });
           }
           gifs.forEach(url => {
-            const safe = document.createElement('img'); safe.className = 'chat-img'; safe.src = url;
-            addMsg('lincoln', safe.outerHTML, null, [], null, true);
+            const safe = createChatMedia(url);
+            msgEls[msgEls.length-1].querySelector('.msg-bubble').appendChild(safe);
           });
         } else {
-          addMsg(role, m.content, m.timestamp, m.reactions||[], null, false, m.seen, m.audioUrl);
+          addMsg(role, m.gifUrl ? '' : m.content, m.timestamp, m.reactions||[], m.gifUrl || m.imageUrl || null, false, m.seen, m.audioUrl);
         }
       });
     }
     showScreen('chat');
+    followMessages = true; scroll();
   } catch(e) { console.error('Open chat error:',e); }
 }
 
 async function newChat() {
+  if (waiting) return;
   try {
     const res=await vfetch(`${API}/api/chats/switch`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
     const data=await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not create conversation');
     chatId=data.chatId;
     msgEls=[];
     $('msgs').innerHTML='<div class="date-sep"><span id="chatDate"></span></div>';
@@ -1198,13 +1215,14 @@ function setDateSep() {
 async function checkHealth() {
   try {
     const r=await fetch(`${API}/api/health`,{signal:AbortSignal.timeout(5000)});
-    const d=await r.json(); chatId=d.currentChat; setConn(true); return true;
+    if (!r.ok) throw new Error('Unreachable');
+    setConn(true); return true;
   } catch(e) { setConn(false); return false; }
 }
 
-async function sendMsg(text, imageBase64, audioUrl=null) {
+async function sendMsg(text, imageBase64, audioUrl=null, imageUrl=null, gifUrl=null) {
   if(waiting) return;
-  waiting=true; $('sendBtn').disabled=true; $('chatIn').disabled=true;
+  waiting=true; $('sendBtn').disabled=true;
   $('chatStatus').innerHTML='<span style="color:var(--accent-dim);font-style:italic">thinking...</span>';
 
   // Create a streaming message bubble immediately
@@ -1218,18 +1236,32 @@ async function sendMsg(text, imageBase64, audioUrl=null) {
 
   let fullText = '';
   const bubble = $('stream-bubble');
+  let renderFrame = null, streamError = null, completed = false;
+  const renderStream = () => {
+    if (renderFrame !== null) return;
+    renderFrame = requestAnimationFrame(() => {
+      renderFrame = null;
+      bubble.innerHTML = emoji(md(esc(fullText))) + '<span class="stream-cursor"></span>';
+      scroll();
+    });
+  };
 
   try {
-    const body = { message: text };
+    const body = { message: text, chatId };
     if (imageBase64) body.image = imageBase64;
     if (audioUrl) body.audioUrl = audioUrl;
+    if (imageUrl) body.imageUrl = imageUrl;
+    if (gifUrl) body.gifUrl = gifUrl;
     const res = await vfetch(`${API}/api/message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
 
-    if (!res.ok) throw new Error(`Error ${res.status}`);
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({}));
+      throw new Error(error.error || `Error ${res.status}`);
+    }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -1250,8 +1282,7 @@ async function sendMsg(text, imageBase64, audioUrl=null) {
 
           if (event.type === 'delta') {
             fullText += event.text;
-            bubble.innerHTML = md(emoji(esc(fullText))) + '<span class="stream-cursor"></span>';
-            scroll();
+            renderStream();
           }
 
           if (event.type === 'tool') {
@@ -1274,25 +1305,38 @@ async function sendMsg(text, imageBase64, audioUrl=null) {
             const ts = event.timestamp;
             $('stream-ts').innerHTML = fmtTime(ts) + `<span class="msg-seen" id="seen-${streamIdx}"></span>`;
           }
+          if (event.type === 'saved') {
+            fullText = event.text; completed = true;
+            event.reactions?.forEach((reactions, idx) => {
+              const el = $(`rx-${idx}`); if (el) el.innerHTML = buildReacts(reactions, idx);
+            });
+          }
 
           if (event.type === 'error') {
-            addSys(event.error || 'Stream error');
+            streamError = event.error || 'Stream error';
           }
         } catch(e) {}
       }
     }
 
+    if (streamError) throw new Error(streamError);
+    if (!completed) throw new Error('Reply interrupted. Reopen this conversation to check the saved reply before resending.');
+    if (renderFrame !== null) cancelAnimationFrame(renderFrame);
     // Finalize: process GIFs and reactions from the complete text, clean up cursor
     processStreamedResponse(fullText, streamIdx, bubble);
     setConn(true);
     setLincolnStatus(lincolnStatus);
 
   } catch(e) {
+    if (renderFrame !== null) cancelAnimationFrame(renderFrame);
+    if (fullText) bubble.innerHTML = emoji(md(esc(fullText)));
     if (!fullText) { streamDiv.remove(); msgEls.pop(); }
     addSys('Connection: ' + e.message);
     setConn(false);
   } finally {
-    waiting=false; $('sendBtn').disabled=false; $('chatIn').disabled=false; $('chatIn').focus();
+    streamDiv.querySelector('#stream-ts')?.removeAttribute('id');
+    waiting=false; $('sendBtn').disabled=false;
+    setLincolnStatus(lincolnStatus);
   }
 }
 
@@ -1357,31 +1401,7 @@ function seekVoice(e, wrap) {
 function processStreamedResponse(text, idx, bubble) {
   let clean = text;
 
-  // Strip [REACT:emoji:index] tags
-  const reacts = [];
-  while (true) {
-    const s = clean.indexOf('[REACT:');
-    if (s === -1) break;
-    const e = clean.indexOf(']', s);
-    if (e === -1) break;
-    const tag = clean.substring(s, e + 1);
-    const lc = tag.lastIndexOf(':');
-    if (lc > 7) {
-      const emoji = tag.substring(7, lc);
-      const ri = parseInt(tag.substring(lc + 1, tag.length - 1));
-      if (!isNaN(ri)) reacts.push({ emoji, idx: ri });
-    }
-    clean = clean.substring(0, s) + clean.substring(e + 1);
-  }
-
-  reacts.forEach(async r => {
-    try {
-      const res = await vfetch(`${API}/api/react`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messageIndex: r.idx, emoji: r.emoji, from: 'lincoln' }) });
-      const data = await res.json();
-      const el = $(`rx-${r.idx}`);
-      if (el) el.innerHTML = buildReacts(data.reactions, r.idx);
-    } catch(e) {}
-  });
+  clean = clean.replace(/\[REACT:[^\]]*\]/g, '');
 
   // Extract [STATUS:text] — Lincoln sets his own status
   const statusRx = /\[STATUS:([^\]]+)\]/g;
@@ -1393,7 +1413,7 @@ function processStreamedResponse(text, idx, bubble) {
 
   // Extract [GIF](url) tags
   const gifs = [];
-  const gifRx = /\[GIF\]\((https?:\/\/[^\)]+)\)/g;
+  const gifRx = /(?:\[GIF\]|!\[[^\]]*\])\(<?(https?:\/\/[^\s)>]+)>?\)/gi;
   let gm;
   while ((gm = gifRx.exec(clean)) !== null) {
     try { const u = new URL(gm[1]); if (u.protocol === 'https:' || u.protocol === 'http:') gifs.push(u.href); } catch(e) {}
@@ -1410,7 +1430,8 @@ function processStreamedResponse(text, idx, bubble) {
   clean = clean.replace(voiceRx, '').trim();
 
   // Update the bubble with cleaned content (remove cursor)
-  bubble.innerHTML = md(emoji(esc(clean)));
+  bubble.innerHTML = emoji(md(esc(clean)));
+  bubble.classList.toggle('emoji-only', isEmojiOnly(clean));
 
   // Append voice players inline in the bubble
   voices.forEach(url => {
@@ -1423,29 +1444,12 @@ function processStreamedResponse(text, idx, bubble) {
   const REMOJI_HTML = REMOJI.map(e => `<span data-e="${e}" data-i="${idx}">${e}</span>`).join('');
   bubble.insertAdjacentHTML('beforeend', `<div class="react-bar" id="rb-${idx}">${REMOJI_HTML}</div>`);
 
-  // Wire up reaction handlers
-  bubble.addEventListener('click', e => {
-    if (e.target.hasAttribute('data-e') || e.target.closest('.voice-memo')) return;
-    if (e.target.tagName === 'IMG' && e.target.classList.contains('chat-img')) { openLightbox(e.target.src); return; }
-    document.querySelectorAll('.react-bar.show').forEach(b => b.classList.remove('show'));
-    bubble.querySelector('.react-bar').classList.toggle('show');
-  });
-  bubble.querySelectorAll('.react-bar span').forEach(s => {
-    s.addEventListener('click', async e => {
-      e.stopPropagation();
-      try {
-        const res = await vfetch(`${API}/api/react`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messageIndex: parseInt(s.dataset.i), emoji: s.dataset.e, from: 'arden' }) });
-        const data = await res.json();
-        $(`rx-${s.dataset.i}`).innerHTML = buildReacts(data.reactions, parseInt(s.dataset.i));
-      } catch(e) {}
-      bubble.querySelector('.react-bar').classList.remove('show');
-    });
-  });
+  wireReactions(bubble, idx);
 
   // Add GIF messages
   gifs.forEach(url => {
-    const safe = document.createElement('img'); safe.className = 'chat-img'; safe.src = url;
-    addMsg('lincoln', safe.outerHTML, null, [], null, true);
+    const safe = createChatMedia(url);
+    bubble.appendChild(safe);
   });
 
   // Observe for seen
@@ -1463,10 +1467,10 @@ function addMsg(role, text, ts, reactions=[], imgUrl=null, raw=false, seen=null,
   const time=fmtTime(ts);
   let html;
   if(raw) { html=text; }
-  else { html=md(emoji(esc(text))); }
+  else { html=emoji(md(esc(text))); }
   const isImgOnly = raw && text.trim().startsWith('<img');
-  const bubbleCls = `msg-bubble${isImgOnly?' img-only':''}`;
-  const img=imgUrl?`<img class="chat-img" src="${imgUrl}">`:'';
+  const bubbleCls = `msg-bubble${isImgOnly?' img-only':''}${!raw && !imgUrl && !audioUrl && isEmojiOnly(text)?' emoji-only':''}`;
+  const img='';
   const audio=audioUrl?buildVoicePlayer(audioUrl):'';
   const rx=buildReacts(reactions,idx);
   // Seen indicator for Lincoln's messages
@@ -1479,6 +1483,7 @@ function addMsg(role, text, ts, reactions=[], imgUrl=null, raw=false, seen=null,
   }
   msgEls.push(div);
   $('msgs').appendChild(div);
+  if (imgUrl) div.querySelector('.msg-bubble').insertBefore(createChatMedia(imgUrl), div.querySelector('.react-bar'));
 
   // Auto-mark Lincoln's messages as seen when they scroll into view
   if(role==='lincoln' && !seen) {
@@ -1486,25 +1491,7 @@ function addMsg(role, text, ts, reactions=[], imgUrl=null, raw=false, seen=null,
     if(seenObserver) seenObserver.observe(div);
   }
 
-  // Reaction toggle
-  div.querySelector('.msg-bubble').addEventListener('click',e=>{
-    if(e.target.hasAttribute('data-e') || e.target.closest('.voice-memo')) return;
-    if(e.target.tagName==='IMG' && e.target.classList.contains('chat-img')) { openLightbox(e.target.src); return; }
-    document.querySelectorAll('.react-bar.show').forEach(b=>b.classList.remove('show'));
-    div.querySelector('.react-bar').classList.toggle('show');
-  });
-  // Reaction click
-  div.querySelectorAll('.react-bar span').forEach(s=>{
-    s.addEventListener('click',async e=>{
-      e.stopPropagation();
-      try {
-        const res=await vfetch(`${API}/api/react`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messageIndex:parseInt(s.dataset.i),emoji:s.dataset.e,from:'arden'})});
-        const data=await res.json();
-        $(`rx-${s.dataset.i}`).innerHTML=buildReacts(data.reactions,parseInt(s.dataset.i));
-      } catch(e){}
-      div.querySelector('.react-bar').classList.remove('show');
-    });
-  });
+  wireReactions(div.querySelector('.msg-bubble'), idx);
   scroll();
 }
 
@@ -1521,7 +1508,7 @@ function processStoredMessage(text) {
   clean = clean.replace(statusRx, '');
   // Extract [GIF](url) tags
   const gifs = [];
-  const gifRx = /\[GIF\]\((https?:\/\/[^\)]+)\)/g;
+  const gifRx = /(?:\[GIF\]|!\[[^\]]*\])\(<?(https?:\/\/[^\s)>]+)>?\)/gi;
   let gm;
   while ((gm = gifRx.exec(clean)) !== null) {
     try { const u = new URL(gm[1]); if (u.protocol === 'https:' || u.protocol === 'http:') gifs.push(u.href); } catch(e) {}
@@ -1540,10 +1527,65 @@ function processStoredMessage(text) {
 
 function buildReacts(rx,idx) {
   if(!rx||rx.length===0) return '';
-  const c={};
+  const c=Object.create(null);
   rx.forEach(r=>{ if(!c[r.emoji])c[r.emoji]={n:0,mine:false}; c[r.emoji].n++; if(r.from==='arden')c[r.emoji].mine=true; });
-  return Object.entries(c).map(([e,d])=>`<span class="react-pill${d.mine?' mine':''}">${e}${d.n>1?' '+d.n:''}</span>`).join('');
+  return Object.entries(c).map(([e,d])=>`<button type="button" class="react-pill${d.mine?' mine':''}" data-i="${idx}" data-e="${esc(e).replace(/"/g,'&quot;')}" aria-pressed="${d.mine}">${emoji(esc(e))}${d.n>1?' '+d.n:''}</button>`).join('');
 }
+
+function createChatMedia(url) {
+  const img = document.createElement('img'); img.className='chat-img'; img.alt='GIF or image';
+  img.addEventListener('load', () => scroll());
+  img.addEventListener('error', () => {
+    const link = document.createElement('a'); link.className='media-fallback';
+    link.textContent='Image unavailable — open original'; link.href=url; link.target='_blank'; link.rel='noopener noreferrer';
+    img.replaceWith(link);
+  }, { once:true });
+  img.src=url;
+  return img;
+}
+
+function wireReactions(bubble, idx) {
+  const bar = bubble.querySelector('.react-bar');
+  bar.innerHTML = REMOJI.map(e => `<button type="button" data-e="${e}" data-i="${idx}" aria-label="React ${e}">${e}</button>`).join('');
+  const trigger = document.createElement('button'); trigger.type='button'; trigger.className='reaction-trigger'; trigger.textContent='React';
+  trigger.setAttribute('aria-expanded','false');
+  const toggle = () => {
+    const opening = !bar.classList.contains('show');
+    document.querySelectorAll('.react-bar.show').forEach(el => el.classList.remove('show'));
+    document.querySelectorAll('.reaction-trigger').forEach(el => el.setAttribute('aria-expanded','false'));
+    bar.classList.toggle('show', opening); trigger.setAttribute('aria-expanded',String(opening));
+  };
+  trigger.addEventListener('click', e => { e.stopPropagation(); toggle(); });
+  bubble.appendChild(trigger);
+  bubble.addEventListener('click', e => {
+    if (e.target.closest('button, a, .voice-memo')) return;
+    if (e.target.matches('img.chat-img')) { openLightbox(e.target.src); return; }
+    if (!window.getSelection()?.toString()) toggle();
+  });
+}
+
+const pendingReactions = new Set();
+$('msgs').addEventListener('click', async e => {
+  const button = e.target.closest('button[data-e][data-i]');
+  if (!button) return;
+  e.stopPropagation();
+  const idx = Number(button.dataset.i), requestedChat = chatId, key = `${requestedChat}:${idx}`;
+  if (pendingReactions.has(key)) return;
+  pendingReactions.add(key); button.disabled=true;
+  try {
+    const res = await vfetch(`${API}/api/react`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chatId:requestedChat, messageIndex:idx, emoji:button.dataset.e, from:'arden'})});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not save reaction');
+    if (chatId === requestedChat) {
+      const el = $(`rx-${idx}`); if (el) el.innerHTML=buildReacts(data.reactions,idx);
+    }
+  } catch(error) { addSys(error.message); }
+  finally {
+    pendingReactions.delete(key); button.disabled=false;
+    button.closest('.msg')?.querySelector('.react-bar')?.classList.remove('show');
+    button.closest('.msg')?.querySelector('.reaction-trigger')?.setAttribute('aria-expanded','false');
+  }
+});
 
 function addSys(t) {
   const d=document.createElement('div'); d.className='date-sep';
@@ -1566,11 +1608,30 @@ function emoji(t) {
     `<img class="inline-emoji" src="/emojis/${c}.png" alt="${c}" title=":${c}:" onerror="this.replaceWith(document.createTextNode('${m}'))">`
   );
 }
+function isEmojiOnly(text) {
+  const rest = text.trim().replace(/:[a-zA-Z0-9_-]+:/g, '').replace(/(?:\p{Extended_Pictographic}|\p{Regional_Indicator}|\p{Emoji_Modifier}|[\uFE0F\u200D\u20E3]|[0-9#*]\uFE0F?\u20E3|\s)/gu, '');
+  return text.trim().length > 0 && !rest;
+}
+function insertEmoji(value) {
+  const input = $('chatIn');
+  input.setRangeText(value, input.selectionStart, input.selectionEnd, 'end');
+  input.dispatchEvent(new Event('input'));
+  input.focus();
+  $('emoPick').classList.remove('show');
+}
 function fmtTime(ts) {
   if(!ts) return new Date().toLocaleTimeString('en-NZ',{hour:'2-digit',minute:'2-digit',hour12:false});
   return new Date(ts).toLocaleTimeString('en-NZ',{hour:'2-digit',minute:'2-digit',hour12:false});
 }
-function scroll() { requestAnimationFrame(()=>{ $('msgs').scrollTo({ top: $('msgs').scrollHeight, behavior: 'smooth' }); }); }
+let followMessages = true, scrollFrame = null;
+$('msgs').addEventListener('scroll', () => {
+  const el = $('msgs');
+  followMessages = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+}, { passive:true });
+function scroll() {
+  if (!followMessages || scrollFrame !== null) return;
+  scrollFrame = requestAnimationFrame(() => { scrollFrame = null; $('msgs').scrollTop = $('msgs').scrollHeight; });
+}
 function setLincolnStatus(text) {
   lincolnStatus = text || 'present';
   $('chatStatus').innerHTML = `<span class="dot" style="display:inline-block;width:5px;height:5px;background:var(--accent);border-radius:50%;margin-right:5px;vertical-align:middle;animation:pulse 3s ease-in-out infinite"></span>${esc(lincolnStatus)}`;
@@ -1593,7 +1654,7 @@ function initDefaultEmoji() {
   const g=$('defaultEmo');
   DEFAULT_EMO.forEach(e=>{
     const d=document.createElement('div'); d.className='pick-item'; d.textContent=e;
-    d.addEventListener('click',()=>{ $('chatIn').value+=e; $('chatIn').focus(); $('emoPick').classList.remove('show'); });
+    d.addEventListener('click',()=>insertEmoji(e));
     g.appendChild(d);
   });
 }
@@ -1606,26 +1667,39 @@ async function loadCustomEmoji() {
     data.emojis.forEach(f=>{
       const d=document.createElement('div'); d.className='pick-item';
       d.innerHTML=`<img src="/emojis/${f}" alt="${f.replace('.png','')}">`;
-      d.addEventListener('click',()=>{ $('chatIn').value+=`:${f.replace('.png','')}:`; $('chatIn').focus(); $('emoPick').classList.remove('show'); });
+      d.addEventListener('click',()=>insertEmoji(`:${f.replace('.png','')}:`));
       g.appendChild(d);
     });
   } catch(e){}
 }
+let gifSearchController = null;
 async function searchGif(q) {
-  if(!q.trim()){$('gifR').innerHTML='';return;}
+  gifSearchController?.abort();
+  if(!q.trim()) { $('gifR').textContent=''; return; }
+  const controller = new AbortController(); gifSearchController = controller;
+  $('gifR').textContent='Searching…';
   try {
-    const res=await vfetch(`${API}/api/gifs?q=${encodeURIComponent(q)}`);
+    const res=await vfetch(API + '/api/gifs?q=' + encodeURIComponent(q), {signal:controller.signal});
     const data=await res.json();
-    $('gifR').innerHTML=(data.results||[]).map(g=>`<img src="${g.preview}" data-url="${g.url}">`).join('');
-    $('gifR').querySelectorAll('img').forEach(img=>{
-      img.addEventListener('click',()=>{
-        addMsg('arden',`<img class="chat-img" src="${img.dataset.url}">`,null,[],null,true);
-        sendMsg('*sends a GIF*');
+    if (!res.ok) throw new Error(data.error || 'GIF search unavailable');
+    if (controller !== gifSearchController) return;
+    $('gifR').textContent='';
+    for (const gif of data.results || []) {
+      const img = document.createElement('img'); img.src=gif.preview; img.alt='Send GIF';
+      img.addEventListener('click', async () => {
+        if (waiting || doSend.uploading) return;
+        followMessages=true;
+        addMsg('arden','',null,[],gif.url);
         $('gifPick').classList.remove('show');
-        $('gifQ').value=''; $('gifR').innerHTML='';
+        $('gifQ').value=''; $('gifR').textContent='';
+        await sendMsg('*sends a GIF*', null, null, null, gif.url);
       });
-    });
-  } catch(e){}
+      $('gifR').appendChild(img);
+    }
+    if (!$('gifR').children.length) $('gifR').textContent='No GIFs found. Try another search.';
+  } catch(error) {
+    if (!controller.signal.aborted) $('gifR').textContent=error.message;
+  }
 }
 
 /* ============================================
@@ -1706,9 +1780,29 @@ async function loadSchedules() {
   try {
     const res=await vfetch(`${API}/api/schedules`); if(!res.ok)return;
     const {schedules}=await res.json();
-    const active=(schedules||[]).filter(s=>['pending','running','failed'].includes(s.status)).slice(-12);
+    const active=(schedules||[]).slice(-12);
     $('scheduleList').innerHTML=active.length?active.map(s=>`<div class="schedule-item"><div class="schedule-item-head"><span>${esc(new Date(s.runAt).toLocaleString('en-NZ'))} · ${esc(s.status)}</span>${s.status==='pending'?`<button class="schedule-cancel" data-schedule-id="${s.id}">&times;</button>`:''}</div><div class="schedule-item-body">${esc(s.prompt)}${s.error?`<br><span style="color:var(--error)">${esc(s.error)}</span>`:''}</div></div>`).join(''):'<div class="settings-note">Nothing scheduled yet.</div>';
     document.querySelectorAll('.schedule-cancel').forEach(button=>button.addEventListener('click',async()=>{ await vfetch(`${API}/api/schedules/${button.dataset.scheduleId}`,{method:'DELETE'}); loadSchedules(); }));
+    active.forEach((schedule, index) => {
+      const item = $('scheduleList').children[index];
+      if (schedule.nextAttemptAt) {
+        const next = document.createElement('div'); next.className='settings-note';
+        next.textContent=`Next attempt: ${new Date(schedule.nextAttemptAt).toLocaleString('en-NZ')}`;
+        item.appendChild(next);
+      }
+      if (schedule.status === 'failed' || (schedule.status === 'pending' && schedule.error)) {
+        const retry = document.createElement('button'); retry.className='schedule-action'; retry.textContent='Retry now';
+        retry.addEventListener('click', async () => {
+          retry.disabled = true;
+          try {
+            const res = await vfetch(`${API}/api/schedules/${schedule.id}/retry`, {method:'POST'});
+            if (!res.ok) throw new Error('Could not retry this message');
+            await loadSchedules();
+          } catch(error) { alert(error.message); retry.disabled = false; }
+        });
+        item.appendChild(retry);
+      }
+    });
   } catch(e) {}
 }
 
@@ -1887,6 +1981,12 @@ $('settingsBtn').addEventListener('click',()=>{ showScreen('settings'); refreshP
 $('chatBack').addEventListener('click',()=>{ showScreen('home'); refreshHome(); });
 $('sendBtn').addEventListener('click',doSend);
 $('chatIn').addEventListener('input',()=>{ const i=$('chatIn'); i.style.height='auto'; i.style.height=Math.min(i.scrollHeight,120)+'px'; });
+// Keep Enter available for multiline writing on touch keyboards and during IME composition.
+$('chatIn').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && matchMedia('(pointer:fine)').matches) {
+    e.preventDefault(); doSend();
+  }
+});
 
 // Emoji
 $('emoBtn').addEventListener('click',()=>{ $('emoPick').classList.toggle('show'); $('gifPick').classList.remove('show'); });
@@ -2001,12 +2101,16 @@ async function doSend() {
   const text=$('chatIn').value.trim();
   if(!text&&!pendImg&&!pendVoice) return; if(waiting) return;
   if(pendVoice&&!text&&!pendVoice.transcript) return alert('Add a caption so Lincoln can understand the voice note.');
+  if (doSend.uploading) return;
+  doSend.uploading = true;
+  $('sendBtn').disabled = true;
+  $('chatIn').disabled = true;
+  try {
   let imgUrl=null;
   let imgBase64=null;
   if(pendImg) {
     imgBase64 = await compressImage(pendImg); // compress for API
-    try { const res=await vfetch(`${API}/api/upload`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:pendImg})}); const data=await res.json(); imgUrl=data.url; } catch(e){}
-    pendImg=null; $('imgPrev').classList.remove('show');
+    try { const res=await vfetch(`${API}/api/upload`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:pendImg})}); const data=await res.json(); if(!res.ok)throw new Error(data.error||'Image upload failed'); imgUrl=data.url; } catch(error){ alert(error.message); return; }
   }
   let audioUrl=null;
   let transcript=text;
@@ -2019,11 +2123,45 @@ async function doSend() {
     } catch(error) { return alert(error.message); }
   }
   const msg=transcript||'*sent an image*';
+  followMessages = true;
   addMsg('arden',msg,null,[],imgUrl,false,null,audioUrl);
+  pendImg=null; $('imgPrev').classList.remove('show');
   $('chatIn').value=''; $('chatIn').style.height='auto';
+  $('chatIn').disabled=false; $('chatIn').focus();
   if(pendVoice) clearVoice();
-  sendMsg(msg, imgBase64, audioUrl);
+  await sendMsg(msg, imgBase64, audioUrl, imgUrl);
+  } finally { doSend.uploading = false; $('sendBtn').disabled = waiting; $('chatIn').disabled = false; }
 }
+
+let syncingChat = false;
+async function syncScheduledReplies() {
+  if (syncingChat || waiting || doSend.uploading || document.hidden || !$('chat').classList.contains('active') || !chatId) return;
+  syncingChat = true;
+  const requestedChat = chatId;
+  try {
+    const res = await vfetch(`${API}/api/chats/${encodeURIComponent(requestedChat)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (waiting || doSend.uploading || requestedChat !== chatId) return;
+    // Only append server-created scheduled replies; do not overwrite a local draft or partial stream.
+    const extra = data.messages.slice(msgEls.length);
+    if (extra.length && extra.every(m => m.scheduled)) {
+      for (const m of extra) {
+        const { clean, gifs, voices } = processStoredMessage(m.content);
+        addMsg('lincoln', clean, m.timestamp, m.reactions || [], null, false, m.seen);
+        const bubble = msgEls[msgEls.length - 1].querySelector('.msg-bubble');
+        for (const url of gifs) { const img = createChatMedia(url); bubble.appendChild(img); }
+        for (const url of voices) bubble.insertAdjacentHTML('beforeend', buildVoicePlayer(url));
+      }
+    }
+  } catch (error) { console.warn('Conversation refresh failed:', error.message); }
+  finally { syncingChat = false; }
+}
+setInterval(() => {
+  syncScheduledReplies();
+  if (!document.hidden && $('settings').classList.contains('active')) loadSchedules();
+}, 5000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) syncScheduledReplies(); });
 
 /* ============================================
    BOOT

@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "sync:letta-memory": "node scripts/sync-letta-memory.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test tests/*.test.js"
   },
   "keywords": [],
   "author": "",
