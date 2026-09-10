@@ -21,6 +21,7 @@ ANTHROPIC_API_KEY=
 CLAUDE_MODEL=
 GIPHY_API_KEY=
 VALE_HUB_URL=
+VALE_HUB_API_KEY=
 COMPANONION_URL=
 VIDEO_MCP_URL=
 GAMES_MCP_URL=
@@ -28,6 +29,12 @@ GAMES_MCP_URL=
 
 `PORT` is supplied by most hosts automatically. `VALE_DATA_DIR` defaults to
 `/data` in the Docker image.
+
+For the Vale Hub connector, set `VALE_HUB_URL` to the Hub's `/sse` URL and
+`VALE_HUB_API_KEY` to the same secret value as `API_KEY` on the Vale Hub service.
+House sends it as a Bearer token on the SSE connection and subsequent MCP POSTs.
+A Hub `401` means this credential is missing or was rejected. Keep the key in
+Railway variables, never in the URL or source control.
 
 ## Persistent storage
 

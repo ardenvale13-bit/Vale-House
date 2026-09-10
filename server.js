@@ -43,6 +43,7 @@ const AVAILABLE_MODELS = [
   { id: 'letta', label: 'Letta (Free)', tier: 'letta', cost: '$0' }
 ];
 const VALE_HUB_URL = env.VALE_HUB_URL || process.env.VALE_HUB_URL;
+const VALE_HUB_API_KEY = env.VALE_HUB_API_KEY || process.env.VALE_HUB_API_KEY;
 const COMPANONION_URL = env.COMPANONION_URL || process.env.COMPANONION_URL;
 const VIDEO_MCP_URL = env.VIDEO_MCP_URL || process.env.VIDEO_MCP_URL;
 const GAMES_MCP_URL = env.GAMES_MCP_URL || process.env.GAMES_MCP_URL;
@@ -67,11 +68,12 @@ if (LETTA_AGENT_ID) { console.log(`  🧠 Letta agent configured: ${LETTA_AGENT_
 // MCP CLIENT (SSE Transport)
 // =============================================
 class McpClient extends EventEmitter {
-  constructor(sseUrl, label, timeout) {
+  constructor(sseUrl, label, timeout, apiKey) {
     super();
     this.sseUrl = sseUrl;
     this.label = label || 'MCP';
     this.timeout = timeout || 15000;
+    this.authHeaders = apiKey ? { Authorization:`Bearer ${apiKey}` } : {};
     this.postEndpoint = null;
     this.tools = [];
     this.toolFilter = null; // Set of allowed tool names (null = no filter)
@@ -99,7 +101,8 @@ class McpClient extends EventEmitter {
     // Step 3: Send initialized notification (fire-and-forget, no id)
     await fetch(this.postEndpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...this.authHeaders },
+      redirect: 'error',
       body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })
     });
 
@@ -122,7 +125,8 @@ class McpClient extends EventEmitter {
 
       try {
         const res = await fetch(this.sseUrl, {
-          headers: { 'Accept': 'text/event-stream', 'Cache-Control': 'no-cache' }
+          headers: { 'Accept': 'text/event-stream', 'Cache-Control': 'no-cache', ...this.authHeaders },
+          redirect: 'error'
         });
 
         if (!res.ok) {
@@ -166,7 +170,14 @@ class McpClient extends EventEmitter {
 
                 if (eventType === 'endpoint' && data && !endpointResolved) {
                   const base = new URL(this.sseUrl);
-                  this.postEndpoint = new URL(data.trim(), base.origin).href;
+                  const endpoint = new URL(data.trim(), base.origin);
+                  if (endpoint.origin !== base.origin && this.authHeaders.Authorization) {
+                    clearTimeout(timeout);
+                    reject(new Error(`${this.label} returned a cross-origin authenticated endpoint`));
+                    await this.reader.cancel();
+                    return;
+                  }
+                  this.postEndpoint = endpoint.href;
                   this.connected = true;
                   endpointResolved = true;
                   console.log(`  ✓ ${this.label} connected, endpoint: ${this.postEndpoint}`);
@@ -225,10 +236,12 @@ class McpClient extends EventEmitter {
       try {
         const res = await fetch(this.postEndpoint, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...this.authHeaders },
+          redirect: 'error',
           body: JSON.stringify({ jsonrpc: '2.0', method, params, id })
         });
 
+        if (!res.ok) throw new Error(`${this.label} ${method} HTTP ${res.status}`);
         // Some servers return result directly in POST response
         if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
           try {
@@ -456,7 +469,7 @@ class McpManager {
 
 // Build the manager
 const mcpManager = new McpManager();
-if (VALE_HUB_URL) mcpManager.add('Vale-Hub', new McpClient(VALE_HUB_URL, 'Vale-Hub'));
+if (VALE_HUB_URL) mcpManager.add('Vale-Hub', new McpClient(VALE_HUB_URL, 'Vale-Hub', undefined, VALE_HUB_API_KEY));
 if (COMPANONION_URL) mcpManager.add('Companonion', new McpClient(COMPANONION_URL, 'Companonion', 45000), [
   'edge', 'escalate', 'get_qr_code', 'get_toys', 'pattern',
   'preset', 'stop', 'tease', 'vibrate', 'vibrate_pattern'
