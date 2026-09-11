@@ -21,6 +21,9 @@ Verified locally:
 - Reactions toggle on/off and reject requests for a different active conversation.
 - Lincoln's reaction tags are applied idempotently on the server.
 - Multiple GIF search tags resolve without skipping adjacent tags.
+- Letta receives current reaction metadata, reaction additions/removals, Arden's
+  selected mood, supported output directives, and the actual custom emoji names
+  with the next message. Reacting alone does not invoke the provider.
 
 Deployment/device verification still required:
 

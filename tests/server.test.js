@@ -12,10 +12,12 @@ test('server preserves long histories, blocks switching during replies, and pers
   const nativeRequire = createRequire(serverPath);
   const source = fs.readFileSync(serverPath, 'utf8');
   let release;
+  const providerRequests = [];
   const gate = new Promise(resolve => { release = resolve; });
   const context = vm.createContext({
     require: name => name === '@letta-ai/letta-client' ? { Letta:class {
-      constructor() { this.agents = { messages:{ create:async () => {
+      constructor() { this.agents = { messages:{ create:async (agentId, body) => {
+        providerRequests.push(body);
         await gate;
         return (async function* () { yield {message_type:'assistant_message', content:'Saved reply'}; })();
       } } }; }
@@ -58,4 +60,15 @@ test('server preserves long histories, blocks switching during replies, and pers
   const reaction = {chatId:'existing', messageIndex:60, emoji:'🖤', from:'arden'};
   assert.equal((await (await request('/api/react', reaction)).json()).reactions.length, 1);
   assert.equal((await (await request('/api/react', reaction)).json()).reactions.length, 0);
+  assert.equal(providerRequests.length, 1, 'Reactions must not wake Letta');
+  const next = await request('/api/message', {chatId:'existing', message:'Did you see my reaction?'});
+  await next.text();
+  assert.equal(providerRequests.length, 2);
+  const content = providerRequests[1].messages[0].content;
+  assert.match(content, /VALE HOUSE INTERFACE CONTRACT/);
+  assert.match(content, /"action":"added"/);
+  assert.match(content, /"action":"removed"/);
+  assert.match(content, /"messageIndex":60/);
+  assert.match(content, /"messageText":"new message"/);
+  assert.match(content, /Did you see my reaction\?/);
 });

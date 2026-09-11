@@ -7,6 +7,7 @@ const { EventEmitter } = require('events');
 const { Letta } = require('@letta-ai/letta-client');
 const webpush = require('web-push');
 const { applyReactions, resolveGifs } = require('./scripts/message-content');
+const { buildHouseContext } = require('./scripts/letta-context');
 
 const app = express();
 const PORT = process.env.PORT || 3333;
@@ -891,8 +892,25 @@ if (LETTA_AGENT_ID) {
   setInterval(checkLettaHealth, 30000);
 }
 
-async function handleLettaMessage(message, imageBase64, clientRes = null) {
-  let input = message || '';
+async function resolveHouseMedia(text) {
+  return resolveGifs(text, async query => {
+      if (!GIPHY_KEY) return null;
+      const res = await fetch('https://api.giphy.com/v1/gifs/search?api_key=' + GIPHY_KEY + '&q=' + encodeURIComponent(query) + '&limit=1&rating=r', { signal:AbortSignal.timeout(10000) });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.data?.[0]?.images?.original?.url || data.data?.[0]?.images?.fixed_height?.url;
+    });
+}
+
+async function handleLettaMessage(message, imageBase64, clientRes = null, houseChat = null) {
+  const emojiDir = path.join(__dirname, 'public', 'emojis');
+  const input = buildHouseContext({
+    chatId:houseChat?.chatId || currentChatId,
+    history:houseChat?.history || conversationHistory,
+    presence:ardenPresence,
+    emojiFiles:fs.existsSync(emojiDir) ? fs.readdirSync(emojiDir) : [],
+    gifAvailable:!!GIPHY_KEY
+  }) + '[ARDEN MESSAGE]\n' + (message || 'Arden sent you an image.');
 
   // Use the current create-message route. Letta keeps the agent's history server-side.
   let content = input;
@@ -1027,13 +1045,7 @@ app.post('/api/message', async (req, res) => {
       await handleClaudeMessage(conversationHistory, message, image, res, (text) => { fullResponse = text; });
     }
 
-    fullResponse = await resolveGifs(fullResponse, async query => {
-      if (!GIPHY_KEY) return null;
-      const res = await fetch('https://api.giphy.com/v1/gifs/search?api_key=' + GIPHY_KEY + '&q=' + encodeURIComponent(query) + '&limit=1&rating=r', { signal:AbortSignal.timeout(10000) });
-      if (!res.ok) return null;
-      const data = await res.json();
-      return data.data?.[0]?.images?.original?.url || data.data?.[0]?.images?.fixed_height?.url;
-    });
+    fullResponse = await resolveHouseMedia(fullResponse);
 
     // Save the final text response to conversation history
     applyReactions(fullResponse, conversationHistory);
@@ -1075,6 +1087,10 @@ app.post('/api/react', (req, res) => {
     } else {
       conversationHistory[messageIndex].reactions.push({ emoji, from, timestamp: new Date().toISOString() });
     }
+    const target = conversationHistory[messageIndex];
+    target.reactionChanges = [...(target.reactionChanges || []), {
+      emoji, from, action:existing >= 0 ? 'removed' : 'added', timestamp:new Date().toISOString()
+    }].slice(-8);
     saveChatToFile(currentChatId, conversationHistory);
     res.json({ reactions: conversationHistory[messageIndex].reactions });
   } else {
@@ -1225,7 +1241,10 @@ async function processDueSchedules() {
     for (const schedule of due) {
       schedule.chatId ||= currentChatId;
       await runSchedule(schedule, {
-        generate: prompt => queueLettaRequest(() => handleLettaMessage(`[SCHEDULED MESSAGE FROM ARDEN]\nArden asked you earlier to respond at this time. Their request was: ${prompt}\nRespond directly and naturally to Arden now.`, null)),
+        generate: async prompt => resolveHouseMedia(await queueLettaRequest(() => handleLettaMessage(`[SCHEDULED MESSAGE FROM ARDEN]\nArden asked you earlier to respond at this time. Their request was: ${prompt}\nRespond directly and naturally to Arden now.`, null, null, {
+          chatId:schedule.chatId,
+          history:schedule.chatId === currentChatId ? conversationHistory : (loadChatFromFile(schedule.chatId)?.messages || [])
+        }))),
         saveMessage: async job => {
           const history = job.chatId === currentChatId ? conversationHistory : (loadChatFromFile(job.chatId)?.messages || []);
           if (!history.some(m => m.scheduleId === job.id)) {
