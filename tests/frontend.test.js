@@ -19,6 +19,11 @@ test('formats multiline text and custom emoji without changing asset attributes'
   assert.match(result, /<em>you<\/em>/);
 });
 
+test('custom emoji uses its registered WebP filename', () => {
+  vm.runInContext("customEmojiFiles['arden-heh-innocent']='arden-heh-innocent.webp'", context);
+  assert.match(context.emoji(':arden-heh-innocent:'), /src="\/emojis\/arden-heh-innocent.webp"/);
+});
+
 test('emoji picker replaces the selected text at the caret and triggers input resizing', () => {
   let change, focused = false, closed = false;
   const input = { selectionStart:2, selectionEnd:5, setRangeText:(...args) => { change=args; }, dispatchEvent:event => assert.equal(event.type,'input'), focus:() => { focused=true; } };

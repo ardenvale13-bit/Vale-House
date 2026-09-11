@@ -1603,9 +1603,10 @@ function md(t) {
     .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g,'<em>$1</em>')
     .replace(/\n/g,'<br>');
 }
+const customEmojiFiles = Object.create(null);
 function emoji(t) {
   return t.replace(/:([a-zA-Z0-9_-]+):/g,(m,c)=>
-    `<img class="inline-emoji" src="/emojis/${c}.png" alt="${c}" title=":${c}:" onerror="this.replaceWith(document.createTextNode('${m}'))">`
+    `<img class="inline-emoji" src="/emojis/${customEmojiFiles[c] || c + '.png'}" alt="${c}" title=":${c}:" onerror="this.replaceWith(document.createTextNode('${m}'))">`
   );
 }
 function isEmojiOnly(text) {
@@ -1665,9 +1666,12 @@ async function loadCustomEmoji() {
     const data=await res.json();
     const g=$('customEmo');
     data.emojis.forEach(f=>{
+      const code=f.replace(/\.(png|gif|svg|webp)$/i,'');
+      if (!/^[a-zA-Z0-9_-]+$/.test(code)) return;
+      customEmojiFiles[code]=f;
       const d=document.createElement('div'); d.className='pick-item';
-      d.innerHTML=`<img src="/emojis/${f}" alt="${f.replace('.png','')}">`;
-      d.addEventListener('click',()=>insertEmoji(`:${f.replace('.png','')}:`));
+      d.innerHTML=`<img loading="lazy" src="/emojis/${f}" alt="${code}">`;
+      d.addEventListener('click',()=>insertEmoji(`:${code}:`));
       g.appendChild(d);
     });
   } catch(e){}

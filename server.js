@@ -1307,7 +1307,7 @@ app.get('/api/emojis', (req, res) => {
   const emojiDir = path.join(__dirname, 'public', 'emojis');
   try {
     if (fs.existsSync(emojiDir)) {
-      const files = fs.readdirSync(emojiDir).filter(f => /\.(png|gif|svg)$/i.test(f));
+      const files = fs.readdirSync(emojiDir).filter(f => /\.(png|gif|svg|webp)$/i.test(f));
       res.json({ emojis: files });
     } else { res.json({ emojis: [] }); }
   } catch (e) { res.json({ emojis: [] }); }
