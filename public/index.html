@@ -376,6 +376,19 @@ input[type="file"] { display:none; }
 }
 .ib:hover { background:var(--bg-msg-lincoln); color:var(--accent); }
 .ib.gif-btn { font-size:11px; font-weight:700; font-family:var(--font-mono); }
+.attach-toggle { display:none; font-size:26px; }
+.composer-actions { display:flex; gap:6px; }
+@media(max-width:600px) {
+  .attach-toggle { display:flex; }
+  .composer-actions { display:none; position:absolute; bottom:calc(100% + 8px); left:12px;
+    padding:8px; gap:8px; border:1px solid var(--border); border-radius:24px;
+    background:var(--bg-surface); box-shadow:0 4px 20px rgba(0,0,0,.35); z-index:101; }
+  .composer-actions.show { display:flex; animation:popUp .15s ease; }
+  .composer-actions .ib, .attach-toggle, .input-bar .send { width:44px; height:44px; }
+  .input-bar .chat-input { min-height:44px; }
+  .input-bar .gif-pick { left:12px; width:min(300px,calc(100vw - 24px)); }
+  .input-bar .emoji-pick { width:min(280px,calc(100vw - 24px)); }
+}
 .chat-input {
   flex:1; background:var(--bg-elevated); border:1px solid var(--border);
   border-radius:20px; padding:8px 16px; color:var(--text-1);
@@ -669,10 +682,12 @@ input[type="file"] { display:none; }
     <div class="typing-dots"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>
   </div>
   <div class="input-bar" style="position:relative">
-    <button class="ib" id="emoBtn">&#9786;</button>
-    <button class="ib gif-btn" id="gifBtn">GIF</button>
-    <button class="ib" id="imgBtn">&#128247;</button>
-    <button class="ib" id="micBtn" title="Record voice note">&#127908;</button>
+    <button class="ib attach-toggle" id="attachBtn" aria-label="Add emoji, GIF or photo" aria-expanded="false" aria-controls="composerActions">+</button>
+    <div class="composer-actions" id="composerActions" role="group" aria-label="Message extras">
+      <button class="ib" id="emoBtn" aria-label="Choose emoji">&#9786;</button>
+      <button class="ib gif-btn" id="gifBtn" aria-label="Choose GIF">GIF</button>
+      <button class="ib" id="imgBtn" aria-label="Attach photo">&#128247;</button>
+    </div>
     <input type="file" id="imgIn" accept="image/*">
     <div class="picker emoji-pick" id="emoPick">
       <div class="pick-title">Vale House</div>
@@ -815,7 +830,7 @@ input[type="file"] { display:none; }
    STATE
    ============================================ */
 const API=window.location.origin;
-let waiting=false, chatId=null, pendImg=null, pendVoice=null, msgEls=[], gifTimer=null, VTOKEN='';
+let waiting=false, chatId=null, pendImg=null, pendGif=null, pendVoice=null, msgEls=[], gifTimer=null, VTOKEN='';
 let mediaRecorder=null, mediaStream=null, voiceChunks=[], voiceStartedAt=0, speechRecognition=null, voiceTranscript='';
 let lincolnStatus = 'present'; // Lincoln's self-set status text
 let currentMood=null, seenObserver=null;
@@ -1175,7 +1190,7 @@ async function openChat(id) {
             msgEls[msgEls.length-1].querySelector('.msg-bubble').appendChild(safe);
           });
         } else {
-          addMsg(role, m.gifUrl ? '' : m.content, m.timestamp, m.reactions||[], m.gifUrl || m.imageUrl || null, false, m.seen, m.audioUrl);
+          addMsg(role, m.gifUrl && m.content === '*sends a GIF*' ? '' : m.content, m.timestamp, m.reactions||[], m.gifUrl || m.imageUrl || null, false, m.seen, m.audioUrl);
         }
       });
     }
@@ -1677,6 +1692,16 @@ async function loadCustomEmoji() {
   } catch(e){}
 }
 let gifSearchController = null;
+function selectGif(gif) {
+  if ($('chatIn').disabled) return;
+  pendGif=gif.url; pendImg=null;
+  $('imgPrevImg').src=gif.preview || gif.url;
+  $('imgPrevImg').alt='Attached GIF';
+  $('imgPrev').classList.add('show');
+  $('gifPick').classList.remove('show');
+  $('gifQ').value=''; $('gifR').textContent='';
+  $('chatIn').focus();
+}
 async function searchGif(q) {
   gifSearchController?.abort();
   if(!q.trim()) { $('gifR').textContent=''; return; }
@@ -1689,15 +1714,8 @@ async function searchGif(q) {
     if (controller !== gifSearchController) return;
     $('gifR').textContent='';
     for (const gif of data.results || []) {
-      const img = document.createElement('img'); img.src=gif.preview; img.alt='Send GIF';
-      img.addEventListener('click', async () => {
-        if (waiting || doSend.uploading) return;
-        followMessages=true;
-        addMsg('arden','',null,[],gif.url);
-        $('gifPick').classList.remove('show');
-        $('gifQ').value=''; $('gifR').textContent='';
-        await sendMsg('*sends a GIF*', null, null, null, gif.url);
-      });
+      const img = document.createElement('img'); img.src=gif.preview; img.alt='Attach GIF';
+      img.addEventListener('click', () => selectGif(gif));
       $('gifR').appendChild(img);
     }
     if (!$('gifR').children.length) $('gifR').textContent='No GIFs found. Try another search.';
@@ -1993,8 +2011,20 @@ $('chatIn').addEventListener('keydown', e => {
 });
 
 // Emoji
-$('emoBtn').addEventListener('click',()=>{ $('emoPick').classList.toggle('show'); $('gifPick').classList.remove('show'); });
-$('gifBtn').addEventListener('click',()=>{ $('gifPick').classList.toggle('show'); $('emoPick').classList.remove('show'); if($('gifPick').classList.contains('show'))$('gifQ').focus(); });
+function closeComposerActions() {
+  $('composerActions').classList.remove('show');
+  $('attachBtn').setAttribute('aria-expanded','false');
+}
+$('attachBtn').addEventListener('click',()=>{
+  const open=$('composerActions').classList.toggle('show');
+  $('attachBtn').setAttribute('aria-expanded',String(open));
+  $('emoPick').classList.remove('show'); $('gifPick').classList.remove('show');
+});
+$('emoBtn').addEventListener('click',()=>{ closeComposerActions(); $('emoPick').classList.toggle('show'); $('gifPick').classList.remove('show'); });
+$('gifBtn').addEventListener('click',()=>{ closeComposerActions(); $('gifPick').classList.toggle('show'); $('emoPick').classList.remove('show'); if($('gifPick').classList.contains('show'))$('gifQ').focus(); });
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape') { closeComposerActions(); $('emoPick').classList.remove('show'); $('gifPick').classList.remove('show'); }
+});
 
 // Model pill
 $('modelPill').addEventListener('click',(e)=>{ e.stopPropagation(); buildModelPicker(); $('modelPicker').classList.toggle('show'); });
@@ -2003,19 +2033,19 @@ $('sModel').addEventListener('change',()=>{ switchModel($('sModel').value); });
 $('gifQ').addEventListener('input',()=>{ clearTimeout(gifTimer); gifTimer=setTimeout(()=>searchGif($('gifQ').value),400); });
 
 // Image
-$('imgBtn').addEventListener('click',()=>$('imgIn').click());
+$('imgBtn').addEventListener('click',()=>{ closeComposerActions(); $('emoPick').classList.remove('show'); $('gifPick').classList.remove('show'); $('imgIn').click(); });
 $('imgIn').addEventListener('change',e=>{
   const f=e.target.files[0]; if(!f)return;
   const r=new FileReader();
-  r.onload=ev=>{ pendImg=ev.target.result; $('imgPrevImg').src=pendImg; $('imgPrev').classList.add('show'); };
+  r.onload=ev=>{ pendImg=ev.target.result; pendGif=null; $('imgPrevImg').src=pendImg; $('imgPrevImg').alt='Attached image'; $('imgPrev').classList.add('show'); };
   r.readAsDataURL(f); $('imgIn').value='';
 });
-$('imgRm').addEventListener('click',()=>{ pendImg=null; $('imgPrev').classList.remove('show'); });
-$('micBtn').addEventListener('click',toggleRecording);
+$('imgRm').addEventListener('click',()=>{ pendImg=null; pendGif=null; $('imgPrev').classList.remove('show'); $('imgPrevImg').removeAttribute('src'); });
 $('voiceRm').addEventListener('click',clearVoice);
 
 // Close pickers on outside click
 document.addEventListener('click',e=>{
+  if(!e.target.closest('#composerActions')&&!e.target.closest('#attachBtn')) closeComposerActions();
   if(!e.target.closest('.picker')&&!e.target.closest('.ib')) {
     $('emoPick').classList.remove('show');
     $('gifPick').classList.remove('show');
@@ -2103,7 +2133,7 @@ function compressImage(dataUrl, maxBytes=4500000) {
 // Send handler
 async function doSend() {
   const text=$('chatIn').value.trim();
-  if(!text&&!pendImg&&!pendVoice) return; if(waiting) return;
+  if(!text&&!pendImg&&!pendGif&&!pendVoice) return; if(waiting) return;
   if(pendVoice&&!text&&!pendVoice.transcript) return alert('Add a caption so Lincoln can understand the voice note.');
   if (doSend.uploading) return;
   doSend.uploading = true;
@@ -2126,14 +2156,15 @@ async function doSend() {
       const data=await res.json(); if(!res.ok)throw new Error(data.error||'Voice upload failed'); audioUrl=data.url;
     } catch(error) { return alert(error.message); }
   }
-  const msg=transcript||'*sent an image*';
+  const gifUrl=pendGif;
+  const msg=transcript||(gifUrl?'*sends a GIF*':'*sent an image*');
   followMessages = true;
-  addMsg('arden',msg,null,[],imgUrl,false,null,audioUrl);
-  pendImg=null; $('imgPrev').classList.remove('show');
+  addMsg('arden',gifUrl && !transcript ? '' : msg,null,[],gifUrl||imgUrl,false,null,audioUrl);
+  pendImg=null; pendGif=null; $('imgPrev').classList.remove('show');
   $('chatIn').value=''; $('chatIn').style.height='auto';
   $('chatIn').disabled=false; $('chatIn').focus();
   if(pendVoice) clearVoice();
-  await sendMsg(msg, imgBase64, audioUrl, imgUrl);
+  await sendMsg(msg, imgBase64, audioUrl, imgUrl, gifUrl);
   } finally { doSend.uploading = false; $('sendBtn').disabled = waiting; $('chatIn').disabled = false; }
 }
 
