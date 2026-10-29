@@ -7,7 +7,6 @@ const { EventEmitter } = require('events');
 const { Letta } = require('@letta-ai/letta-client');
 const webpush = require('web-push');
 const { applyReactions, resolveGifs } = require('./scripts/message-content');
-const { buildHouseContext } = require('./scripts/letta-context');
 
 const app = express();
 const PORT = process.env.PORT || 3333;
@@ -51,7 +50,7 @@ const GAMES_MCP_URL = env.GAMES_MCP_URL || process.env.GAMES_MCP_URL;
 const LETTA_URL = env.LETTA_URL || process.env.LETTA_URL || 'http://localhost:8283';
 const LETTA_AGENT_ID = env.LETTA_AGENT_ID || process.env.LETTA_AGENT_ID;
 const LETTA_API_KEY = env.LETTA_API_KEY || process.env.LETTA_API_KEY || '';
-const LETTA_CONVERSATION_ID = env.LETTA_CONVERSATION_ID || process.env.LETTA_CONVERSATION_ID;
+const LETTA_CONVERSATION_ID = env.LETTA_CONVERSATION_ID ?? process.env.LETTA_CONVERSATION_ID ?? 'conv-44d04ca9-2078-44bc-8082-a10c813a6cbe';
 const LETTA_FALLBACK_TO_CLAUDE = (env.LETTA_FALLBACK_TO_CLAUDE || process.env.LETTA_FALLBACK_TO_CLAUDE || '').toLowerCase() === 'true';
 const VALE_DATA_DIR = env.VALE_DATA_DIR || process.env.VALE_DATA_DIR || '';
 const VAPID_SUBJECT = env.VAPID_SUBJECT || process.env.VAPID_SUBJECT || 'mailto:vale-house@valeverse.party';
@@ -903,14 +902,9 @@ async function resolveHouseMedia(text) {
 }
 
 async function handleLettaMessage(message, imageBase64, clientRes = null, houseChat = null) {
-  const emojiDir = path.join(__dirname, 'public', 'emojis');
-  const input = buildHouseContext({
-    chatId:houseChat?.chatId || currentChatId,
-    history:houseChat?.history || conversationHistory,
-    presence:ardenPresence,
-    emojiFiles:fs.existsSync(emojiDir) ? fs.readdirSync(emojiDir) : [],
-    gifAvailable:!!GIPHY_KEY
-  }) + '[ARDEN MESSAGE]\n' + (message || 'Arden sent you an image.');
+  // Letta retains its own history. Send only the message, with no House rules,
+  // conversation excerpts, emoji catalogue, or presence/reaction snapshots.
+  const input = message || 'Arden sent you an image.';
 
   // Use the current create-message route. Letta keeps the agent's history server-side.
   let content = input;
@@ -938,21 +932,22 @@ async function handleLettaMessage(message, imageBase64, clientRes = null, houseC
 
   let stream;
   const requestOptions = { signal:AbortSignal.timeout(120000) };
+  const send = body => LETTA_CONVERSATION_ID
+    ? lettaClient.conversations.messages.create(LETTA_CONVERSATION_ID, body, requestOptions)
+    : lettaClient.agents.messages.create(LETTA_AGENT_ID, body, requestOptions);
   try {
-    stream = await lettaClient.agents.messages.create(LETTA_AGENT_ID, reqBody, requestOptions);
+    stream = await send(reqBody);
   } catch (error) {
     if (!imageBase64) throw error;
     console.log('  🧠 Letta: multimodal failed, retrying text-only');
     const textOnly = input || 'Arden sent you a photo';
-    stream = await lettaClient.agents.messages.create(
-      LETTA_AGENT_ID,
+    stream = await send(
       {
         messages: [{ role: 'user', content: textOnly }],
         streaming: true,
         stream_tokens: true,
         include_pings: true
-      },
-      requestOptions
+      }
     );
   }
 

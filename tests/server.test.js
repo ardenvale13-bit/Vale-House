@@ -6,24 +6,31 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { createRequire } = require('node:module');
 
-test('server preserves long histories, blocks switching during replies, and persists the final stream text', async t => {
+for (const conversationId of ['', 'conv-test']) {
+test(`server preserves histories and sends plain messages to ${conversationId || 'the default agent conversation'}`, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vale-house-test-'));
   const serverPath = path.join(__dirname, '../server.js');
   const nativeRequire = createRequire(serverPath);
   const source = fs.readFileSync(serverPath, 'utf8');
   let release;
   const providerRequests = [];
+  const providerTargets = [];
   const gate = new Promise(resolve => { release = resolve; });
   const context = vm.createContext({
     require: name => name === '@letta-ai/letta-client' ? { Letta:class {
-      constructor() { this.agents = { messages:{ create:async (agentId, body) => {
+      constructor() {
+        const create = route => async (id, body) => {
+        providerTargets.push({route, id});
         providerRequests.push(body);
         await gate;
         return (async function* () { yield {message_type:'assistant_message', content:'Saved reply'}; })();
-      } } }; }
+        };
+        this.agents = {messages:{create:create('agent')}};
+        this.conversations = {messages:{create:create('conversation')}};
+      }
     } } : nativeRequire(name),
     __dirname:root,
-    process:{ env:{VALE_TOKEN:'test', LETTA_AGENT_ID:'test-agent', CLAUDE_MODEL:'letta'}, pid:process.pid },
+    process:{ env:{VALE_TOKEN:'test', LETTA_AGENT_ID:'test-agent', LETTA_CONVERSATION_ID:conversationId, CLAUDE_MODEL:'letta'}, pid:process.pid },
     console:{log() {}, error() {}}, Buffer, URL, AbortSignal,
     fetch:async () => ({ok:true}),
     setInterval() {}, setTimeout() {}, clearTimeout() {},
@@ -65,10 +72,10 @@ test('server preserves long histories, blocks switching during replies, and pers
   await next.text();
   assert.equal(providerRequests.length, 2);
   const content = providerRequests[1].messages[0].content;
-  assert.match(content, /VALE HOUSE INTERFACE CONTRACT/);
-  assert.match(content, /"action":"added"/);
-  assert.match(content, /"action":"removed"/);
-  assert.match(content, /"messageIndex":60/);
-  assert.match(content, /"messageText":"new message"/);
-  assert.match(content, /Did you see my reaction\?/);
+  assert.equal(providerRequests[1].messages.length, 1);
+  assert.equal(content, 'Did you see my reaction?');
+  assert.deepEqual(providerTargets, Array.from({length:2}, () => ({
+    route:conversationId ? 'conversation' : 'agent', id:conversationId || 'test-agent'
+  })));
 });
+}

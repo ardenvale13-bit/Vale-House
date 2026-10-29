@@ -14,6 +14,12 @@ LETTA_API_KEY=<your Letta API key>
 LETTA_AGENT_ID=<your hosted agent ID>
 ```
 
+House defaults to Letta conversation `conv-44d04ca9-2078-44bc-8082-a10c813a6cbe`.
+Set `LETTA_CONVERSATION_ID` to override it, or explicitly set it to an empty
+value to use the configured agent's default conversation. House sends only the
+current message and any attached image; it does not prepend interface rules,
+conversation excerpts, presence, emoji lists, or reaction snapshots.
+
 Optional integrations:
 
 ```text
